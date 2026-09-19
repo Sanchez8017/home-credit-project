@@ -1,0 +1,31 @@
+---
+title: "Home Credit Project Portfolio"
+author: "Alejo Sanchez"
+date: "2026-09-18"
+---
+
+## Overview
+
+This project addresses a business problem for Home Credit, a consumer finance company. Its primary objective is to investigate how traditional and alternative customer information can support the prediction of default risk.
+
+The project covers the complete analytical process, from business framing and data mapping through exploratory analysis, modeling, and communication of findings. The analysis emphasizes the business value and practical implications of the results.
+
+This project also serves as part of my professional data analytics portfolio.
+
+## Project Sections
+
+The project will include:
+
+- Business and industry context
+- Three-layer data map
+- Data-quality assessment
+- Exploratory data analysis
+- Predictive modeling
+- Model evaluation
+- Business findings and recommendations
+
+## Development
+
+The analysis is being developed in R using Positron and Quarto, with Git and GitHub supporting version control and publication.
+
+

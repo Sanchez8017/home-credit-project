@@ -1,0 +1,33 @@
+# Positron and editor settings
+.posit/
+.positron/
+.vscode/
+
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Quarto generated files
+.quarto/
+_site/
+*_files/
+*.html
+site_libs/
+
+# Local datasets
+*.csv
+data/raw/*
+data/processed/*
+!data/raw/README.md
+!data/processed/README.md
+
+# Working documents
+*.docx
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+/.quarto/
+**/*.quarto_ipynb
