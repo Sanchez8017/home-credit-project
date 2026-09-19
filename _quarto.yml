@@ -1,6 +1,9 @@
 project:
   type: website
   output-dir: _site
+  execute-dir: project
+  render:
+    - "*.qmd"
 
 website:
   title: "Home Credit Project Portfolio"
@@ -8,6 +11,8 @@ website:
     left:
       - href: index.qmd
         text: Home
+      - href: 01_data_map.qmd
+        text: Data Map
 
 format:
   html:
@@ -18,8 +23,10 @@ format:
     toc-title: "Contents"
     code-fold: true
     code-summary: "Show code"
+    embed-resources: true
 
 execute:
   echo: true
   warning: false
   message: false
+

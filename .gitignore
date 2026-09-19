@@ -16,6 +16,9 @@ _site/
 *.html
 site_libs/
 
+# Knitr execution cache
+*_cache/
+
 # Local datasets
 *.csv
 data/raw/*

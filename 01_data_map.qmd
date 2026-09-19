@@ -1,0 +1,833 @@
+---
+title: "Home Credit Data Map"
+author: "Alejo Sanchez"
+date: last-modified
+---
+
+## Purpose
+
+This page documents the Home Credit data environment before detailed exploratory analysis. It identifies the available source files, their analytical roles, table grains, key identifiers, and relationships.
+
+The data map has three layers:
+
+1. **Business layer:** what each source represents.
+2. **Relational layer:** how the tables connect.
+3. **Analytical layer:** how the tables may contribute to an applicant-level dataset.
+
+```{r}
+#| label: setup
+#| include: false
+
+
+required_packages <- c("DBI", "duckdb", "knitr", "DT")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before rendering: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+raw_data_dir <- file.path("data", "raw")
+
+if (!dir.exists(raw_data_dir)) {
+  stop("The data/raw directory was not found.")
+}
+
+expected_files <- c(
+  "application_train.csv",
+  "application_test.csv",
+  "bureau.csv",
+  "bureau_balance.csv",
+  "previous_application.csv",
+  "POS_CASH_balance.csv",
+  "credit_card_balance.csv",
+  "installments_payments.csv",
+  "sample_submission.csv",
+  "HomeCredit_columns_description.csv"
+)
+
+csv_paths <- list.files(
+  path = raw_data_dir,
+  pattern = "[.]csv$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+csv_lookup <- setNames(csv_paths, basename(csv_paths))
+
+data_file_info <- file.info(csv_paths)
+
+data_signature <- paste(
+  basename(csv_paths),
+  data_file_info$size,
+  as.numeric(data_file_info$mtime),
+  collapse = "|"
+)
+
+knitr::opts_chunk$set(
+  cache.extra = data_signature
+)
+
+escape_sql_path <- function(path) {
+  normalized_path <- normalizePath(
+    path,
+    winslash = "/",
+    mustWork = TRUE
+  )
+
+  gsub("'", "''", normalized_path, fixed = TRUE)
+}
+
+csv_reader <- function(filename) {
+  path <- unname(csv_lookup[filename])
+
+  if (length(path) == 0 || is.na(path)) {
+    return(NA_character_)
+  }
+
+  sprintf(
+  paste0(
+    "read_csv_auto(",
+    "'%s', ",
+    "header = true, ",
+    "all_varchar = true",
+    ")"
+  ),
+  escape_sql_path(path)
+)
+}
+
+format_count <- function(x) {
+  output <- format(
+    x,
+    big.mark = ",",
+    scientific = FALSE,
+    trim = TRUE
+  )
+
+  output[is.na(x)] <- "Not available"
+  output
+}
+
+con <- DBI::dbConnect(
+  duckdb::duckdb(),
+  dbdir = ":memory:"
+)
+```
+
+### Encoding Repair
+
+`HomeCredit_columns_description.csv` contains a small number of rows with a stray `0x85` byte (the Windows-1252 encoding of a horizontal ellipsis, "…"), which is not valid UTF-8 on its own. Rather than dropping those rows, `repair_csv_encoding()` (defined in `R/repair_csv_encoding.R`) rewrites the byte to its proper UTF-8 encoding before the file is registered with DuckDB.
+
+```{r}
+#| label: fix-encoding
+#| include: false
+
+
+source(file.path("R", "repair_csv_encoding.R"))
+
+description_filename <- "HomeCredit_columns_description.csv"
+
+if (description_filename %in% names(csv_lookup)) {
+  # Point the lookup at the recoded copy so downstream queries
+  # read clean UTF-8 without needing ignore_errors for this file.
+  csv_lookup[[description_filename]] <- repair_csv_encoding(
+    csv_lookup[[description_filename]]
+  )
+}
+```
+
+## Raw Data Inventory
+
+The inventory distinguishes analytical tables from supporting files. Dimensions are calculated directly from the CSV files stored in `data/raw/`.
+
+```{r}
+#| label: table-definitions
+#| include: false
+#| cache: true
+
+table_definitions <- data.frame(
+  filename = c(
+    "application_train.csv",
+    "application_test.csv",
+    "bureau.csv",
+    "bureau_balance.csv",
+    "previous_application.csv",
+    "POS_CASH_balance.csv",
+    "credit_card_balance.csv",
+    "installments_payments.csv",
+    "sample_submission.csv",
+    "HomeCredit_columns_description.csv"
+  ),
+  table_name = c(
+    "application_train",
+    "application_test",
+    "bureau",
+    "bureau_balance",
+    "previous_application",
+    "POS_CASH_balance",
+    "credit_card_balance",
+    "installments_payments",
+    "sample_submission",
+    "column descriptions"
+  ),
+  role = c(
+    rep("Analytical table", 8),
+    rep("Supporting file", 2)
+  ),
+  grain = c(
+    "One row per training application",
+    "One row per test application",
+    "One row per external bureau credit record",
+    "One row per bureau credit record per month",
+    "One row per previous Home Credit application",
+    "One row per previous POS or cash loan per month",
+    "One row per previous credit-card account per month",
+    "One row per recorded installment payment",
+    "One row per test application",
+    "One row per documented field"
+  ),
+  expected_identifiers = c(
+    "SK_ID_CURR",
+    "SK_ID_CURR",
+    "SK_ID_CURR, SK_ID_BUREAU",
+    "SK_ID_BUREAU",
+    "SK_ID_CURR, SK_ID_PREV",
+    "SK_ID_CURR, SK_ID_PREV",
+    "SK_ID_CURR, SK_ID_PREV",
+    "SK_ID_CURR, SK_ID_PREV",
+    "SK_ID_CURR",
+    "None"
+  ),
+  business_purpose = c(
+    "Current applications used for model development",
+    "Current applications requiring predictions",
+    "Customer credit history reported by external bureaus",
+    "Monthly status history for external bureau credits",
+    "Previous Home Credit loan applications",
+    "Monthly balances for previous POS and cash loans",
+    "Monthly balances for previous credit-card accounts",
+    "Scheduled and actual installment-payment activity",
+    "Required prediction-submission structure",
+    "Definitions and descriptions of dataset fields"
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+#| label: scan-files
+#| include: false
+#| cache: true
+
+scan_csv <- function(path) {
+  column_names <- names(
+    utils::read.csv(
+      path,
+      nrows = 0,
+      check.names = FALSE
+    )
+  )
+
+  row_query <- sprintf(
+    "SELECT COUNT(*) AS n_rows FROM %s",
+    csv_reader(basename(path))
+  )
+
+  row_count <- DBI::dbGetQuery(con, row_query)$n_rows
+
+  identifiers <- intersect(
+    c("SK_ID_CURR", "SK_ID_PREV", "SK_ID_BUREAU"),
+    column_names
+  )
+
+  data.frame(
+    filename = basename(path),
+    n_rows = as.numeric(row_count),
+    n_columns = length(column_names),
+    observed_identifiers = if (length(identifiers) == 0) {
+      "None"
+    } else {
+      paste(identifiers, collapse = ", ")
+    },
+    target_role = switch(
+  basename(path),
+  "application_train.csv" = "Observed outcome",
+  "sample_submission.csv" = "Prediction placeholder",
+  "Not present"
+),
+    stringsAsFactors = FALSE
+  )
+}
+
+measured_inventory <- if (length(csv_paths) > 0) {
+  do.call(rbind, lapply(csv_paths, scan_csv))
+} else {
+  data.frame()
+}
+
+inventory <- merge(
+  table_definitions,
+  measured_inventory,
+  by = "filename",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+inventory <- inventory[
+  match(table_definitions$filename, inventory$filename),
+]
+```
+
+### File Check
+
+```{r}
+#| label: file-check
+#| cache: true
+
+observed_files <- basename(csv_paths)
+
+file_check <- data.frame(
+  Check = c(
+    "Expected CSV files",
+    "Expected files found",
+    "Missing expected files",
+    "Unexpected CSV files"
+  ),
+  Result = c(
+    length(expected_files),
+    sum(expected_files %in% observed_files),
+    if (all(expected_files %in% observed_files)) {
+      "None"
+    } else {
+      paste(
+        setdiff(expected_files, observed_files),
+        collapse = ", "
+      )
+    },
+    if (all(observed_files %in% expected_files)) {
+      "None"
+    } else {
+      paste(
+        setdiff(observed_files, expected_files),
+        collapse = ", "
+      )
+    }
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(file_check, align = c("l", "l"))
+```
+
+### Inventory Summary
+
+```{r}
+#| label: inventory-table
+#| cache: true
+
+inventory_display <- data.frame(
+  Table = inventory$table_name,
+  Role = inventory$role,
+  Rows = format_count(inventory$n_rows),
+  Columns = format_count(inventory$n_columns),
+  Identifiers = inventory$observed_identifiers,
+  `TARGET role` = inventory$target_role,
+  check.names = FALSE
+)
+
+knitr::kable(
+  inventory_display,
+  align = c("l", "l", "r", "r", "l", "c")
+)
+```
+
+### Field Descriptions
+
+The full data dictionary from `HomeCredit_columns_description.csv` is browsable below. Use the column filters to search by source file or field name.
+
+```{r}
+#| label: field-descriptions
+#| cache: true
+
+description_path <- csv_lookup[["HomeCredit_columns_description.csv"]]
+
+description_dictionary <- utils::read.csv(
+  description_path,
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+names(description_dictionary)[1] <- "Row ID"
+
+DT::datatable(
+  description_dictionary,
+  rownames = FALSE,
+  filter = "top",
+  options = list(pageLength = 10, scrollX = TRUE),
+  caption = "Field-level descriptions for each source file."
+)
+```
+
+## Business Layer
+
+The business layer explains what each source represents and why it may matter for default-risk analysis.
+
+```{r}
+#| label: business-layer-table
+#| cache: true
+
+business_display <- data.frame(
+  Table = inventory$table_name,
+  `Unit of observation` = inventory$grain,
+  `Business purpose` = inventory$business_purpose,
+  check.names = FALSE
+)
+
+knitr::kable(
+  business_display,
+  align = c("l", "l", "l")
+)
+```
+
+The current application tables provide the applicant-level foundation. The remaining analytical tables contain historical information that may describe prior credit demand, repayment behavior, account status, and financial obligations.
+
+## Relational Layer
+
+The tables are connected through three principal identifiers:
+
+- `SK_ID_CURR`: current application or customer identifier
+- `SK_ID_PREV`: previous Home Credit application identifier
+- `SK_ID_BUREAU`: external bureau credit-record identifier
+
+```{mermaid}
+flowchart TD
+    A["Current Applications"]
+    B["Bureau Records"]
+    C["Bureau Monthly History"]
+    D["Previous Applications"]
+    E["POS, Card, and Installment History"]
+
+    A -->|"SK_ID_CURR"| B
+    B -->|"SK_ID_BUREAU"| C
+    A -->|"SK_ID_CURR"| D
+    D -->|"SK_ID_PREV"| E
+    A -.->|"SK_ID_CURR"| E
+```
+
+The dotted relationship indicates that the payment and balance tables also contain `SK_ID_CURR`, providing a direct applicant-level aggregation path.
+
+### Primary-Key Checks
+
+The following checks test identifiers that are expected to be unique within their source files.
+
+```{r}
+#| label: primary-key-checks
+#| cache: true
+
+primary_key_definitions <- data.frame(
+  filename = c(
+    "application_train.csv",
+    "application_test.csv",
+    "bureau.csv",
+    "previous_application.csv",
+    "sample_submission.csv"
+  ),
+  key = c(
+    "SK_ID_CURR",
+    "SK_ID_CURR",
+    "SK_ID_BUREAU",
+    "SK_ID_PREV",
+    "SK_ID_CURR"
+  ),
+  stringsAsFactors = FALSE
+)
+
+check_primary_key <- function(filename, key) {
+  if (!filename %in% names(csv_lookup)) {
+    return(
+      data.frame(
+        Table = tools::file_path_sans_ext(filename),
+        Key = key,
+        Rows = NA_real_,
+        `Distinct keys` = NA_real_,
+        `Missing keys` = NA_real_,
+        Status = "File not found",
+        check.names = FALSE
+      )
+    )
+  }
+
+  quoted_key <- as.character(
+    DBI::dbQuoteIdentifier(con, key)
+  )
+
+  query <- sprintf(
+    paste0(
+      "SELECT ",
+      "COUNT(*) AS n_rows, ",
+      "COUNT(DISTINCT %1$s) AS n_distinct, ",
+      "SUM(CASE ",
+      "WHEN %1$s IS NULL OR TRIM(%1$s) = '' ",
+      "THEN 1 ELSE 0 END) AS n_missing ",
+      "FROM %2$s"
+    ),
+    quoted_key,
+    csv_reader(filename)
+  )
+
+  result <- DBI::dbGetQuery(con, query)
+
+  n_rows <- as.numeric(result$n_rows)
+  n_distinct <- as.numeric(result$n_distinct)
+  n_missing <- as.numeric(result$n_missing)
+
+  status <- if (
+    n_rows == n_distinct &&
+    n_missing == 0
+  ) {
+    "Pass"
+  } else {
+    "Review"
+  }
+
+  data.frame(
+    Table = tools::file_path_sans_ext(filename),
+    Key = key,
+    Rows = n_rows,
+    `Distinct keys` = n_distinct,
+    `Missing keys` = n_missing,
+    Status = status,
+    check.names = FALSE
+  )
+}
+
+primary_key_results <- do.call(
+  rbind,
+  Map(
+    check_primary_key,
+    primary_key_definitions$filename,
+    primary_key_definitions$key
+  )
+)
+
+primary_key_display <- primary_key_results
+primary_key_display$Rows <- format_count(primary_key_display$Rows)
+primary_key_display$`Distinct keys` <- format_count(
+  primary_key_display$`Distinct keys`
+)
+primary_key_display$`Missing keys` <- format_count(
+  primary_key_display$`Missing keys`
+)
+
+knitr::kable(
+  primary_key_display,
+  align = c("l", "l", "r", "r", "r", "c")
+)
+```
+
+### Train and Test Separation
+
+```{r}
+#| label: train-test-overlap
+#| cache: true
+
+if (
+  all(
+    c(
+      "application_train.csv",
+      "application_test.csv"
+    ) %in% names(csv_lookup)
+  )
+) {
+  overlap_query <- sprintf(
+    paste0(
+      "SELECT COUNT(*) AS overlap_count ",
+      "FROM %s AS train ",
+      "INNER JOIN %s AS test ",
+      "ON train.SK_ID_CURR = test.SK_ID_CURR"
+    ),
+    csv_reader("application_train.csv"),
+    csv_reader("application_test.csv")
+  )
+
+  overlap_count <- as.numeric(
+    DBI::dbGetQuery(con, overlap_query)$overlap_count
+  )
+
+  overlap_display <- data.frame(
+    Check = "SK_ID_CURR values present in both train and test",
+    Result = format_count(overlap_count),
+    check.names = FALSE
+  )
+} else {
+  overlap_display <- data.frame(
+    Check = "Train/test overlap",
+    Result = "One or both application files were not found",
+    check.names = FALSE
+  )
+}
+
+knitr::kable(overlap_display, align = c("l", "r"))
+```
+
+### Relationship-Coverage Checks
+
+An unmatched child record contains an identifier that is not present in its expected parent table. These records require review before relational joins are used.
+
+```{r}
+#| label: relationship-setup
+#| include: false
+
+
+if (
+  all(
+    c(
+      "application_train.csv",
+      "application_test.csv"
+    ) %in% names(csv_lookup)
+  )
+) {
+  current_ids_query <- sprintf(
+    paste0(
+      "CREATE TEMP TABLE current_ids AS ",
+      "SELECT DISTINCT SK_ID_CURR FROM %s ",
+      "UNION ",
+      "SELECT DISTINCT SK_ID_CURR FROM %s"
+    ),
+    csv_reader("application_train.csv"),
+    csv_reader("application_test.csv")
+  )
+
+  DBI::dbExecute(con, current_ids_query)
+}
+
+if ("bureau.csv" %in% names(csv_lookup)) {
+  bureau_ids_query <- sprintf(
+    paste0(
+      "CREATE TEMP TABLE bureau_ids AS ",
+      "SELECT DISTINCT SK_ID_BUREAU FROM %s"
+    ),
+    csv_reader("bureau.csv")
+  )
+
+  DBI::dbExecute(con, bureau_ids_query)
+}
+
+if ("previous_application.csv" %in% names(csv_lookup)) {
+  previous_ids_query <- sprintf(
+    paste0(
+      "CREATE TEMP TABLE previous_ids AS ",
+      "SELECT DISTINCT SK_ID_PREV FROM %s"
+    ),
+    csv_reader("previous_application.csv")
+  )
+
+  DBI::dbExecute(con, previous_ids_query)
+}
+
+relationship_definitions <- data.frame(
+  child_file = c(
+    "bureau.csv",
+    "bureau_balance.csv",
+    "previous_application.csv",
+    "POS_CASH_balance.csv",
+    "credit_card_balance.csv",
+    "installments_payments.csv"
+  ),
+  child_table = c(
+    "bureau",
+    "bureau_balance",
+    "previous_application",
+    "POS_CASH_balance",
+    "credit_card_balance",
+    "installments_payments"
+  ),
+  child_key = c(
+    "SK_ID_CURR",
+    "SK_ID_BUREAU",
+    "SK_ID_CURR",
+    "SK_ID_PREV",
+    "SK_ID_PREV",
+    "SK_ID_PREV"
+  ),
+  parent_table = c(
+    "current_ids",
+    "bureau_ids",
+    "current_ids",
+    "previous_ids",
+    "previous_ids",
+    "previous_ids"
+  ),
+  parent_label = c(
+    "application_train + application_test",
+    "bureau",
+    "application_train + application_test",
+    "previous_application",
+    "previous_application",
+    "previous_application"
+  ),
+  parent_key = c(
+    "SK_ID_CURR",
+    "SK_ID_BUREAU",
+    "SK_ID_CURR",
+    "SK_ID_PREV",
+    "SK_ID_PREV",
+    "SK_ID_PREV"
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+#| label: relationship-checks
+#| cache: true
+
+check_relationship <- function(
+  child_file,
+  child_table,
+  child_key,
+  parent_table,
+  parent_label,
+  parent_key
+) {
+  available_tables <- DBI::dbListTables(con)
+
+  if (
+    !child_file %in% names(csv_lookup) ||
+    !parent_table %in% available_tables
+  ) {
+    return(
+      data.frame(
+        Child = child_table,
+        Parent = parent_label,
+        Key = child_key,
+        `Unmatched rows` = NA_real_,
+        `Unmatched keys` = NA_real_,
+        Status = "Not evaluated",
+        check.names = FALSE
+      )
+    )
+  }
+
+  child_key_sql <- as.character(
+    DBI::dbQuoteIdentifier(con, child_key)
+  )
+
+  parent_key_sql <- as.character(
+    DBI::dbQuoteIdentifier(con, parent_key)
+  )
+
+  parent_table_sql <- as.character(
+    DBI::dbQuoteIdentifier(con, parent_table)
+  )
+
+  query <- sprintf(
+    paste0(
+      "SELECT ",
+      "SUM(CASE ",
+      "WHEN child.%1$s IS NOT NULL ",
+      "AND parent.%2$s IS NULL ",
+      "THEN 1 ELSE 0 END) AS unmatched_rows, ",
+      "COUNT(DISTINCT CASE ",
+      "WHEN child.%1$s IS NOT NULL ",
+      "AND parent.%2$s IS NULL ",
+      "THEN child.%1$s END) AS unmatched_keys ",
+      "FROM %3$s AS child ",
+      "LEFT JOIN %4$s AS parent ",
+      "ON child.%1$s = parent.%2$s"
+    ),
+    child_key_sql,
+    parent_key_sql,
+    csv_reader(child_file),
+    parent_table_sql
+  )
+
+  result <- DBI::dbGetQuery(con, query)
+
+  unmatched_rows <- as.numeric(result$unmatched_rows)
+  unmatched_keys <- as.numeric(result$unmatched_keys)
+
+  status <- if (unmatched_rows == 0) "Pass" else "Review"
+
+  data.frame(
+    Child = child_table,
+    Parent = parent_label,
+    Key = child_key,
+    `Unmatched rows` = unmatched_rows,
+    `Unmatched keys` = unmatched_keys,
+    Status = status,
+    check.names = FALSE
+  )
+}
+
+relationship_results <- do.call(
+  rbind,
+  Map(
+    check_relationship,
+    relationship_definitions$child_file,
+    relationship_definitions$child_table,
+    relationship_definitions$child_key,
+    relationship_definitions$parent_table,
+    relationship_definitions$parent_label,
+    relationship_definitions$parent_key
+  )
+)
+
+relationship_display <- relationship_results
+relationship_display$`Unmatched rows` <- format_count(
+  relationship_display$`Unmatched rows`
+)
+relationship_display$`Unmatched keys` <- format_count(
+  relationship_display$`Unmatched keys`
+)
+
+knitr::kable(
+  relationship_display,
+  align = c("l", "l", "l", "r", "r", "c")
+)
+```
+
+An unmatched relationship does not automatically mean the data is invalid. It may reflect the scope of the supplied files. Such records should be quantified and handled deliberately rather than removed automatically.
+
+## Analytical Layer
+
+The future modeling table will have one row per current application, identified by `SK_ID_CURR`.
+
+| Source | Required treatment | Potential information |
+|---|---|---|
+| `application_train` | Retain applicant-level grain | Application, income, employment, household, and external-score information |
+| `bureau` | Aggregate by `SK_ID_CURR` | External credit counts, balances, delinquency, and credit age |
+| `bureau_balance` | Aggregate by `SK_ID_BUREAU`, then `SK_ID_CURR` | Monthly bureau status and delinquency history |
+| `previous_application` | Aggregate by `SK_ID_CURR` | Prior approval, refusal, amount, and contract history |
+| `POS_CASH_balance` | Aggregate by `SK_ID_CURR` | POS and cash-loan balance and delinquency behavior |
+| `credit_card_balance` | Aggregate by `SK_ID_CURR` | Credit utilization, balance, drawing, and payment behavior |
+| `installments_payments` | Aggregate by `SK_ID_CURR` | Payment timing, lateness, underpayment, and repayment consistency |
+
+The test table must undergo the same transformations as the training table, but it will not be used when examining relationships with `TARGET`.
+
+## Data-Mapping Conclusions
+
+The data map establishes:
+
+- `application_train` as the modeling foundation.
+- `application_test` as the future scoring population.
+- `SK_ID_CURR` as the main applicant-level integration key.
+- `SK_ID_PREV` as the link to previous Home Credit activity.
+- `SK_ID_BUREAU` as the link to external bureau history.
+- The need to aggregate all historical tables before joining them to the applicant-level modeling table.
+- The need to review unmatched relational keys without assuming they are errors.
+
+```{r}
+#| label: disconnect
+#| include: false
+
+
+DBI::dbDisconnect(con, shutdown = TRUE)
+```
