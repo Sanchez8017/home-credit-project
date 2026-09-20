@@ -1,0 +1,15 @@
+project:
+  output-dir: _reports_site
+  render:
+    - "reports.qmd"
+    - "data_map.md"
+    - "feature_report.md"
+    - "eda_plan.md"
+    - "!index.qmd"
+    - "!01_data_map.qmd"
+    - "!02_industry_context.qmd"
+    - "!03_eda_plan.qmd"
+
+website:
+  title: "Home Credit Analysis Reports"
+  navbar: false

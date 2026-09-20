@@ -1,0 +1,232 @@
+---
+title: "Consumer Credit Industry Context"
+author: "Alejo Sanchez"
+date: last-modified
+---
+
+## Purpose
+
+This page establishes the industry and business context needed to interpret the Home Credit data. The objective is to ensure that later exploratory questions reflect practical consumer-credit concerns rather than statistical relationships alone.
+
+## Research Scope
+
+The dataset does not identify its country, legal jurisdiction, calendar period, or currency. This research therefore focuses on generally applicable consumer-credit and credit-scoring practices.
+
+Country-specific regulations and numerical industry benchmarks should not be treated as directly applicable without additional evidence.
+
+## What Lenders Assess When Evaluating Repayment Risk
+
+Credit underwriting evaluates both a borrower’s ability to repay and evidence of past repayment behavior. The traditional **five Cs of credit**—character, capacity, capital, collateral, and conditions—provide a broad conceptual framework. In consumer lending, these concepts are commonly operationalized through income, payment burden, outstanding debt, credit history, recent credit activity, employment stability, and characteristics of the requested loan.
+
+The [Office of the Comptroller of the Currency's Retail Lending Handbook](https://www.occ.treas.gov/publications-and-resources/publications/comptrollers-handbook/files/retail-lending/pub-ch-retail-lending.pdf) discusses the importance of underwriting standards, repayment capacity, credit history, collateral where applicable, and loan terms in controlling retail credit risk.
+
+### Credit-Scoring Factors
+
+FICO groups information from a consumer’s credit report into five categories:
+
+| Credit-report category | Published FICO weighting |
+|---|---:|
+| Payment history | 35% |
+| Amounts owed | 30% |
+| Length of credit history | 15% |
+| New credit | 10% |
+| Credit mix | 10% |
+
+Source: [myFICO, "What's in my FICO Scores?"](https://www.myfico.com/credit-education/whats-in-your-credit-score)
+
+These percentages provide a useful industry reference, but they are **not expected feature weights for the Home Credit dataset**. FICO notes that their relative importance varies among consumers and credit profiles. Furthermore, FICO scores use credit-report information, while lenders may separately consider income, employment, and the type of credit requested.
+
+### Repayment Capacity
+
+Debt-to-income ratio is conventionally defined as monthly debt payments divided by gross monthly income. It measures the pressure that existing payment obligations place on income.
+
+Source: [Consumer Financial Protection Bureau, "What is a debt-to-income ratio?"](https://www.consumerfinance.gov/ask-cfpb/what-is-a-debt-to-income-ratio-en-1791/)
+
+The Home Credit data does not appear to provide a complete measure of every applicant’s monthly debt payments. Therefore, the analysis will use carefully labeled proxies rather than claiming to calculate a conventional DTI:
+
+- **Annuity-to-income ratio:** current-loan annuity relative to reported income
+- **Credit-to-income ratio:** requested credit relative to reported income
+- **Bureau debt-to-income stock ratio:** reported outstanding bureau debt relative to income
+- **Financing-to-goods-price ratio:** requested credit relative to the stated goods price
+
+These measures capture different aspects of repayment capacity and should not be treated as interchangeable.
+
+### Recent Credit Inquiries
+
+Credit inquiries may indicate recent demand for additional credit. The CFPB notes that scoring models consider how recently and frequently a consumer applies for credit.
+
+However, multiple inquiries can also result from comparison shopping. Some scoring systems group inquiries made within a short period for the same type of credit. Consequently, inquiry counts should be treated as an empirical risk hypothesis rather than automatically labeled as adverse behavior.
+
+Sources:
+
+- [CFPB, "What is a credit inquiry?"](https://www.consumerfinance.gov/ask-cfpb/what-is-a-credit-inquiry-en-1317/)
+- [CFPB, "What kind of credit inquiry has no effect on my credit score?"](https://www.consumerfinance.gov/ask-cfpb/what-kind-of-credit-inquiry-has-no-effect-on-my-credit-score-en-321/)
+
+### Implications for This Project
+
+The industry evidence identifies several feature groups that the Home Credit data may represent:
+
+- repayment capacity and requested-loan burden;
+- previous payment and delinquency behavior;
+- outstanding debt and credit utilization;
+- length and depth of credit history;
+- recent credit inquiries;
+- credit-product diversity; and
+- employment and income stability.
+
+These relationships will be tested rather than assumed. Industry conventions guide the EDA questions, but they do not determine which features are important for this population.
+
+## Industry Metrics and KPIs
+
+Consumer lenders evaluate risk at the applicant, loan, and portfolio levels.
+
+| Area | Common metric | Relevance to this project |
+|---|---|---|
+| Portfolio risk | Default or bad rate | Establish the overall and segment-level `TARGET` rate |
+| Delinquency | 30-, 60-, and 90-days-past-due rates | Examine overdue and payment-delay histories |
+| Expected loss | Probability of default × loss given default × exposure at default | This project primarily addresses probability of default |
+| Underwriting | Approval or acceptance rate | Not directly measurable without the complete applicant and rejection population |
+| Affordability | Payment-to-income, credit-to-income, and debt-to-income ratios | Can be approximated from income, annuity, credit, and debt fields |
+| Account performance | Roll rates, cure rates, and vintage performance | Monthly histories may support behavioral measures, although calendar vintages are unavailable |
+| Profitability | Credit-loss rate and risk-adjusted return | Cannot be fully calculated without pricing, recovery, and operating-cost data |
+| Model discrimination | ROC-AUC, Gini, KS, and precision-recall | Measures how well a model ranks risky applicants |
+| Calibration | Observed versus predicted default rate | Determines whether predicted probabilities represent actual risk |
+| Stability | Population drift and stability measures | Relevant when comparing training and future scoring populations |
+| Inclusion and fairness | Approval and error rates across customer groups | Important when using demographic or alternative information |
+
+The Basel credit-risk framework treats probability of default, loss given default, and exposure at default as separate risk components. A default-prediction model is therefore only one part of a complete credit-loss framework.
+
+There is no universal acceptable default rate or approval rate. Appropriate levels depend on the market, loan product, term, customer population, underwriting policy, economic environment, and the lender's risk appetite.
+
+## Alternative Information
+
+Alternative information may help evaluate applicants who have limited formal credit history. It can potentially improve financial inclusion and model accuracy, but it also introduces concerns involving:
+
+- Privacy and consent
+- Data provenance
+- Fairness and discrimination
+- Use of proxy variables
+- Model explainability
+- Historical bias
+- Data quality and stability
+
+Research by Berg and colleagues found that digital-footprint information can complement credit-bureau information and may improve access to credit. This does not establish that every alternative field in the Home Credit dataset is appropriate or causally related to repayment.
+
+The supplied Home Credit files do **not** contain the device, browser, session, referral, browsing, or other web-behavior data studied by Berg and colleagues. Application timing and contact-channel fields such as `WEEKDAY_APPR_PROCESS_START`, `HOUR_APPR_PROCESS_START`, and `FLAG_EMAIL` should not be labeled as a genuine digital footprint. For this project, available non-bureau information is limited mainly to application, employment, housing, prior Home Credit, and internal repayment fields.
+
+Later analysis should compare traditional bureau information with the non-bureau groups actually present—application, employment, housing, prior Home Credit, and internal repayment information—instead of implying that unavailable digital-footprint data can be tested or treating every field as equally suitable.
+
+## Structural Factors
+
+### Thin Credit Files
+
+Missing bureau history may mean that an applicant has little or no formal credit history. It does not necessarily mean that the data failed to load.
+
+The analysis should distinguish:
+
+- No prior credit history
+- No matching bureau record
+- A field that is not applicable
+- A field that was not collected
+- A genuinely missing value
+
+### Selection Bias
+
+Repayment outcomes are generally observed only for loans that were originated. Applicants rejected under previous lending policies do not produce comparable repayment outcomes.
+
+A model trained on originated loans may therefore not represent all potential applicants.
+
+### Product Differences
+
+Cash loans, consumer loans, POS loans, revolving credit, and credit cards have different:
+
+- Loan purposes
+- Terms
+- Payment structures
+- Utilization patterns
+- Customer populations
+- Risk profiles
+
+Raw outcome rates should be segmented by product before they are compared.
+
+### Reporting Lag
+
+Credit-bureau and monthly account information may be reported with delays. The most recent available balance may not represent the exact application date.
+
+### Performance Windows
+
+Recently originated loans have had less time to develop delinquency. Differences in observation windows can make newer accounts appear less risky.
+
+### Policy Drift
+
+Changes in underwriting rules can change the mix of approved customers. An observed change in default risk may therefore reflect a policy change rather than a change in the underlying population.
+
+## Seasonality and Time Limitations
+
+Consumer-credit demand and repayment can be affected by:
+
+- Holidays and major purchasing periods
+- School and household-expense cycles
+- Employment and income cycles
+- Interest-rate changes
+- Inflation
+- Economic downturns
+- Changes in lending policy
+
+However, the Home Credit files primarily use dates relative to the current application, such as `DAYS_*` and `MONTHS_BALANCE`. They do not provide a usable calendar date.
+
+Consequently, this project should not claim calendar seasonality, recession effects, or country-specific economic effects from the supplied data alone.
+
+## Regulatory and Governance Context
+
+The dataset does not identify the jurisdiction in which the loans were originated. Specific U.S., European Union, or other national lending rules should therefore not be presented as directly applicable.
+
+General credit-model governance principles still suggest that the analysis should document:
+
+- Where each field originated
+- Whether a field is traditional or alternative
+- Whether the field would be known at application time
+- Whether the field could act as a proxy for a protected characteristic
+- How missing values should be interpreted
+- Whether predictions are explainable
+- Whether model errors affect customer groups differently
+- Whether model performance remains stable over time
+
+The World Bank recommends transparent and fair credit-scoring decisions, documented data provenance, privacy safeguards, and regular model validation.
+
+## Implications for Exploratory Analysis
+
+The industry research supports the following EDA questions:
+
+1. What is the overall payment-difficulty rate?
+2. How does payment difficulty vary by loan product and applicant segment?
+3. How do affordability measures relate to payment difficulty?
+4. Do applicants without bureau history differ from applicants with incomplete bureau records?
+5. Which recent repayment behaviors are associated with risk?
+6. Does the recency of previous borrowing matter?
+7. Are risk patterns consistent across cash, POS, revolving, and credit-card products?
+8. Which available non-bureau application and internal-behavior groups add insight beyond traditional bureau history?
+9. Is missingness systematically associated with particular products or customer groups?
+10. Do the training and test populations differ materially?
+11. Which fields may create fairness or proxy-discrimination concerns?
+12. Which findings remain useful after considering both risk reduction and financial inclusion?
+
+These questions will guide the detailed exploratory analysis rather than testing every available variable without a business rationale.
+
+## Sources
+
+Office of the Comptroller of the Currency. [*Retail Lending: Comptroller's Handbook*](https://www.occ.treas.gov/publications-and-resources/publications/comptrollers-handbook/files/retail-lending/pub-ch-retail-lending.pdf).
+
+Consumer Financial Protection Bureau. [*What is a debt-to-income ratio?*](https://www.consumerfinance.gov/ask-cfpb/what-is-a-debt-to-income-ratio-en-1791/).
+
+Consumer Financial Protection Bureau. [*What is a credit inquiry?*](https://www.consumerfinance.gov/ask-cfpb/what-is-a-credit-inquiry-en-1317/) and [*What kind of credit inquiry has no effect on my credit score?*](https://www.consumerfinance.gov/ask-cfpb/what-kind-of-credit-inquiry-has-no-effect-on-my-credit-score-en-321/).
+
+Consumer Financial Protection Bureau. (2017). [*Request for Information Regarding Use of Alternative Data and Modeling Techniques in the Credit Process*](https://files.consumerfinance.gov/f/documents/20170214_cfpb_Alt-Data-RFI.pdf).
+
+FICO. [*What's in my FICO Scores?*](https://www.myfico.com/credit-education/whats-in-your-credit-score).
+
+World Bank Group. (2019). [*Credit Scoring Approaches Guidelines*](https://thedocs.worldbank.org/en/doc/935891585869698451-0130022020/render/CREDITSCORINGAPPROACHESGUIDELINESFINALWEB.txt).
+
+Basel Committee on Banking Supervision. [*Basel Framework: Calculation of Risk-Weighted Assets for Credit Risk*](https://www.bis.org/committees/bcbs/basel-framework/81350/chapter.pdf).
+
+Berg, T., Burg, V., Gombović, A., & Puri, M. (2020). [“On the Rise of FinTechs: Credit Scoring Using Digital Footprints.” *The Review of Financial Studies, 33*(7), 2845–2897](https://academic.oup.com/rfs/article-abstract/33/7/2845/5568311).

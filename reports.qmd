@@ -1,0 +1,32 @@
+---
+title: "Analysis Reports"
+author: "Alejo Sanchez"
+date: last-modified
+output-file: index.html
+---
+
+## Overview
+
+These reports connect the source-data structure, candidate repayment-risk features, and the approved sequence for exploratory analysis.
+
+### 1. [Data Map Report](data_map.md)
+
+Documents each table's grain, keys, relationships, applicant coverage, and observed conflicts with the supplied data dictionary.
+
+### 2. [Feature Report](feature_report.md)
+
+Summarizes evidence-backed features used to assess thin-file consumer applicants and maps each feature to the exact Home Credit tables and columns available to build it.
+
+### 3. [EDA Plan](eda_plan.md)
+
+Orders the standing data checks and proposed analyses so that schema, key, timing, and train/test decisions are resolved before dependent summaries are produced.
+
+## Reading order
+
+```{mermaid}
+flowchart LR
+    A["Data Map Report"] --> B["Feature Report"]
+    B --> C["EDA Plan"]
+```
+
+Start with the data map, continue to the feature report, and finish with the EDA plan.

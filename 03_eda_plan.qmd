@@ -1,0 +1,597 @@
+---
+title: "Exploratory Data Analysis Plan"
+author: "Alejo Sanchez"
+date: last-modified
+---
+
+## Purpose
+
+This document defines the exploratory data analysis strategy for the Home Credit default-risk project.
+
+The plan connects the business context established in the [Industry Context](02_industry_context.qmd) with the source structure documented in the [Data Map](01_data_map.qmd). It defines what the analysis will investigate before detailed analysis or predictive modeling begins.
+
+## Primary Objective
+
+The primary objective is to determine how traditional and alternative customer information can support the prediction of payment difficulty while producing findings that are useful, explainable, and responsible from a consumer-lending perspective.
+
+The EDA will focus on:
+
+- Understanding the target population
+- Identifying meaningful risk patterns
+- Evaluating data quality and coverage
+- Comparing traditional and alternative information
+- Identifying potential modeling risks
+- Translating technical observations into business implications
+
+## Business and Research Questions
+
+### Question 1. What is the baseline level of payment difficulty?
+
+**Business relevance:** Establishes the underlying risk level and determines whether the modeling problem is imbalanced.
+
+**What the analysis will examine:**
+
+- Distribution of `TARGET`
+- Number and percentage of applicants in each outcome group
+- Differences between counts and rates
+- Implications of class imbalance for later model evaluation
+
+**Planned techniques:**
+
+- Frequency tables
+- Proportional summaries
+- Bar charts
+- Class-imbalance assessment
+
+### Question 2. Do Measures of Repayment Capacity Distinguish Payment Difficulty?
+
+This question evaluates whether the available financial variables produce credible measures of repayment capacity and whether those measures differ between applicants with and without observed payment difficulty.
+
+| Proposed measure | Construction | Data-validity question | Risk question |
+|---|---|---|---|
+| Annuity-to-income ratio | `AMT_ANNUITY / AMT_INCOME_TOTAL` | Are the numerator and denominator expressed over compatible periods? Are income values missing, zero, implausible, or concentrated at rounded values? | Does payment difficulty increase as the current-loan payment burden rises? |
+| Credit-to-income ratio | `AMT_CREDIT / AMT_INCOME_TOTAL` | Are income and credit values positive and credible? Are extreme ratios genuine or caused by invalid denominators? | Do applicants requesting more credit relative to income experience greater payment difficulty? |
+| Financing-to-goods-price ratio | `AMT_CREDIT / AMT_GOODS_PRICE` | For which products is `AMT_GOODS_PRICE` applicable? Is missingness explained by product type? How often does the ratio exceed one? | Does financing above the stated goods price carry risk after accounting for product type? |
+| Bureau debt-to-income stock ratio | `sum(AMT_CREDIT_SUM_DEBT) / AMT_INCOME_TOTAL` by `SK_ID_CURR` | Does zero mean no debt, no bureau history, or unavailable information? Are duplicate bureau records affecting the sum? | Does outstanding bureau debt relative to income add information beyond the current-loan ratios? |
+
+The bureau measure is a stock of outstanding debt divided by income. It will not be described as conventional DTI because the dataset does not provide a complete measure of monthly payments for every outstanding debt.
+
+Missingness, non-applicability, and placeholder checks raised in this table will be performed once under Question 7 and reused here; Question 2 will focus on whether each ratio is validly constructed and meaningfully related to payment difficulty.
+
+**Planned techniques include:**
+
+- validity checks for zero, negative, and extreme values;
+- distributions and robust quantiles;
+- comparisons by contract and product category;
+- payment-difficulty rates across ratio bands;
+- bivariate summaries with `TARGET`; and
+- comparison of applicants with bureau history, no matched history, and zero reported debt.
+
+### Question 3. How Do Applicant Characteristics Relate to Payment Difficulty?
+
+**Business relevance:** Applicant characteristics may help describe differences in repayment outcomes, but some fields may also be sensitive characteristics or proxies for them. These relationships require careful descriptive and governance review.
+
+**What the analysis will examine:**
+
+- Age
+- Income and employment type
+- Employment tenure
+- Co-occurrence of the `DAYS_EMPLOYED` sentinel (`365243`) with `NAME_INCOME_TYPE`, and whether it functions as an implicit "Pensioner/Unemployed" flag rather than true missingness
+- Education
+- Family status and household composition
+- Housing situation
+- Occupation
+- Organization type
+- Region and settlement characteristics
+- Potentially sensitive variables and proxy variables
+- Representation and sample size within applicant groups
+
+**Specific questions include:**
+
+- How are applicants distributed across these characteristics?
+- Are missingness and category coverage different across applicant groups?
+- Do observed payment-difficulty rates differ across groups?
+- Are apparent differences stable after considering income, loan product, and sample size?
+- Could any variable directly represent or indirectly proxy for a sensitive characteristic?
+- Would using the field create explainability, fairness, or governance concerns?
+
+**Planned techniques:**
+
+- Frequency and proportion tables
+- Group-level payment-difficulty rates
+- Confidence intervals or uncertainty indicators for group rates
+- Numeric distributions by applicant group
+- Cross-tabulations with loan product and income
+- Missingness comparisons by group
+- Rare-category and small-sample checks
+- Proxy-variable and governance review
+
+Observed group differences will be treated as descriptive associations, not evidence that an applicant characteristic causes payment difficulty. Statistical association alone will not justify including a sensitive or proxy variable in a predictive model.
+
+### Question 4. How does traditional credit-bureau history relate to risk?
+
+**Business relevance:** Bureau accounts, balances, delinquency history, and recent credit inquiries provide a traditional view of an applicant's external credit obligations and credit-seeking behavior.
+
+**What the analysis will examine:**
+
+- Bureau-account volume, status, age, balances, debt, and delinquency history
+- Recent credit-inquiry frequency across the available time windows
+- Applicants with no matched bureau history versus applicants with reported zero balances or inquiries
+- Anomalous positive values in `DAYS_CREDIT_UPDATE` (bureau updates postdating the application); scope and likely cause of this small population
+
+The following application fields will be evaluated:
+
+- `AMT_REQ_CREDIT_BUREAU_HOUR`
+- `AMT_REQ_CREDIT_BUREAU_DAY`
+- `AMT_REQ_CREDIT_BUREAU_WEEK`
+- `AMT_REQ_CREDIT_BUREAU_MON`
+- `AMT_REQ_CREDIT_BUREAU_QRT`
+- `AMT_REQ_CREDIT_BUREAU_YEAR`
+
+The analysis will examine whether inquiry frequency is associated with payment difficulty while avoiding the assumption that every inquiry represents adverse credit-seeking behavior.
+
+**Specific questions include:**
+
+- How complete are the inquiry fields?
+- Are the time-window counts internally plausible?
+- Are inquiry counts heavily concentrated at zero?
+- Does missing inquiry information identify applicants with limited bureau coverage?
+- Does payment difficulty increase with inquiry frequency?
+- Do very recent inquiries behave differently from annual inquiry totals?
+- Could clustered inquiries reflect comparison shopping or repeated credit rejection?
+
+**Planned techniques include:**
+
+- missingness and frequency tables;
+- zero versus nonzero comparisons;
+- distributions by inquiry window;
+- grouped payment-difficulty rates;
+- bivariate comparisons with `TARGET`; and
+- sensitivity checks that distinguish missing values from reported zeros.
+
+Because the data does not identify inquiry purpose or lender type, the analysis cannot directly determine whether multiple inquiries represent rate shopping, applications for different products, or repeated rejection.
+
+### Question 5. What does previous Home Credit activity reveal?
+
+**Business relevance:** Previous applications and their outcomes can distinguish prior product demand, approval history, and contracts that progressed to disbursement from applications that never became active loans.
+
+**What the analysis will examine:**
+
+- Previous-application volume, product mix, requested and granted amounts, and contract outcomes
+- Whether the `365243` sentinel across `DAYS_FIRST_DRAWING`, `DAYS_FIRST_DUE`, `DAYS_LAST_DUE_1ST_VERSION`, `DAYS_LAST_DUE`, and `DAYS_TERMINATION` fires independently per row or co-occurs across fields, and whether it aligns with `NAME_CONTRACT_STATUS` (for example, refused or canceled applications never reaching disbursement)
+- Which fields legitimately carry `XNA` as a structural "not applicable" code linked to `NAME_CONTRACT_STATUS` or `NAME_CONTRACT_TYPE`, versus which represent true missingness
+
+**Planned techniques:**
+
+- Applicant-level counts and amount summaries
+- Contract-status and product cross-tabulations
+- Sentinel co-occurrence patterns
+- Missingness and placeholder comparisons by contract status and type
+- Target-rate comparisons after applicant-level aggregation
+
+### Question 6. Which repayment behaviors are associated with current risk?
+
+**Business relevance:** Recent payment behavior may provide stronger risk information than static applicant characteristics.
+
+**What the analysis will examine:**
+
+- Late installment payments
+- Underpayments
+- Days past due
+- Credit-card utilization
+- Drawing behavior
+- Outstanding balances
+- Remaining installments
+- Contract-status histories
+- Recent versus older behavior
+- What distinguishes the "excess" rows in `installments_payments` under the non-unique (`SK_ID_PREV`, `NUM_INSTALMENT_VERSION`, `NUM_INSTALMENT_NUMBER`) grouping—distinct payment events versus duplicate loads—and which aggregation (sum, count, or last payment) will represent a loan at the applicant level
+
+**Planned techniques:**
+
+- Payment-delay calculations
+- Payment-amount differences
+- Monthly behavioral summaries
+- Maximum, average, and frequency measures
+- Recency-weighted comparisons
+- Applicant-level aggregation
+- Target-rate comparisons
+
+### Question 7. Does missing information represent risk, limited credit history, or non-applicability?
+
+**Business relevance:** Missing values may contain information about customer history or data collection and should not automatically be treated as errors.
+
+**What the analysis will examine:**
+
+- Missingness by table and field
+- Applicants without matched history
+- Missingness by loan product
+- Missingness by target group
+- Fields with structural not-applicable values
+- Field-by-field sentinel/placeholder audit: for each sentinel found, document its rate, whether it clusters with a specific category (income type, contract status, or product type), and its `TARGET` rate relative to non-sentinel rows—not just a listing of which codes exist
+- `XNA` and other placeholder codes reviewed per column rather than as a single blanket pass, since some (for example, `CODE_GENDER`) are negligible while others (for example, `NAME_PRODUCT_TYPE`) cover over half a table
+
+**Planned techniques:**
+
+- Missing-count and missing-rate tables
+- Missingness heatmaps
+- Missingness indicators
+- Co-missingness patterns
+- Target-rate comparisons by missingness status
+- Per-column review of sentinel values such as `365243`, `XNA`, `XAP`, and `Unknown`
+
+No values will be imputed during the initial EDA.
+
+### Question 8. Are risk patterns different across loan products?
+
+**Business relevance:** Cash, consumer, POS, revolving, and credit-card products may serve different customers and have different risk structures.
+
+**What the analysis will examine:**
+
+- Product mix
+- Loan amounts and terms by product
+- Payment behavior by product
+- Target rates by product
+- Missingness and coverage by product
+
+**Planned techniques:**
+
+- Segmented summaries
+- Grouped distributions
+- Target-rate comparisons
+- Interaction tables
+- Product-specific outlier checks
+
+### Question 9. Do the historical tables' unmatched relationship keys represent a systematic population difference?
+
+**Business relevance:** Silently dropping unmatched `SK_ID_PREV` or `SK_ID_BUREAU` rows in joins could bias applicant-level aggregates if those rows are not random.
+
+**What the analysis will examine:**
+
+- Whether unmatched rows differ from matched rows by date range (`MONTHS_BALANCE`), balance magnitude, or other relevant fields
+- Whether unmatched rows cluster before or after a plausible data cutoff
+- Whether unmatched records with a valid `SK_ID_CURR` can be retained through direct applicant-level aggregation
+
+**Planned techniques:**
+
+- Comparative distribution checks for matched versus unmatched records
+- Temporal-boundary checks
+- Coverage and record-loss comparisons under alternative join routes
+
+### Question 10. Do the training and test populations differ?
+
+**Business relevance:** A model may perform poorly if the future scoring population differs materially from the population used for development.
+
+**What the analysis will examine:**
+
+- Numeric-variable distributions
+- Categorical composition
+- Missingness patterns
+- Product mix
+- Applicant and loan characteristics
+
+**Planned techniques:**
+
+- comparing numeric-variable distributions, ranges, quantiles, and missingness rates;
+- identifying categorical levels present only in the training data;
+- identifying previously unseen categorical levels present only in the test data;
+- comparing category-level frequencies between train and test;
+- identifying rare categories whose frequency or presence differs materially;
+- checking whether missingness within important categories changes between train and test; and
+- documenting category differences that may require explicit handling during encoding.
+
+Category-level differences will be treated as evidence of possible population, product, policy, or collection-process differences. They will not automatically be combined or removed.
+
+### Question 11. Which fields are valid, interpretable, and available at decision time?
+
+**Business relevance:** A statistically useful field may still be unsuitable if it was created after the application decision, cannot be explained clearly, or creates governance concerns.
+
+Question 11 will be answered through the canonical implementation sections below rather than a separate duplicate checklist. **Relative-Time Anchor Verification** and the **Decision-Time Availability and Leakage Audit** determine whether fields were available at the current-application decision and whether they contain future realized behavior. The **Field Interpretability Inventory** records business meaning, identifier status, proxy/governance concerns, stability, and the resulting inclusion or exclusion recommendation.
+
+`SK_ID_CURR`, `SK_ID_PREV`, and `SK_ID_BUREAU` will be used for relationships and aggregation, not as predictive features.
+
+### Relative-Time Anchor Verification
+
+The supplied data dictionary confirms that the historical relative-time fields are anchored to the current application.
+
+| Source | Relative-time fields | Confirmed reference point |
+|---|---|---|
+| Current applications | `DAYS_BIRTH`, `DAYS_EMPLOYED`, `DAYS_REGISTRATION`, `DAYS_ID_PUBLISH`, `DAYS_LAST_PHONE_CHANGE` | Current application date |
+| `bureau` | `DAYS_CREDIT`, `DAYS_CREDIT_ENDDATE`, `DAYS_ENDDATE_FACT`, `DAYS_CREDIT_UPDATE` | Current application date |
+| `bureau_balance` | `MONTHS_BALANCE` | Application date, interpreted as the current application through its bureau relationship |
+| `previous_application` | `DAYS_DECISION`, `DAYS_FIRST_DRAWING`, `DAYS_FIRST_DUE`, `DAYS_LAST_DUE_1ST_VERSION`, `DAYS_LAST_DUE`, `DAYS_TERMINATION` | Current application date |
+| `POS_CASH_balance` | `MONTHS_BALANCE` | Current application date |
+| `credit_card_balance` | `MONTHS_BALANCE` | Current application date |
+| `installments_payments` | `DAYS_INSTALMENT`, `DAYS_ENTRY_PAYMENT` | Current application date |
+
+The sign of a field alone will not determine leakage. Scheduled future obligations may have been known at decision time, while future realized payments, balances, terminations, or reporting updates would not have been known.
+
+## Decision-Time Availability and Leakage Audit
+
+A historical record will not be considered valid merely because it appears in a source table. Each table will be evaluated using an explicit timing rule.
+
+A positive relative date will not automatically be classified as leakage. A future contractual date may have been known when the application was evaluated, while a future realized payment, balance, or account update would not have been known.
+
+| Table | Decision-time anchor | Planned operational rule | Fields requiring special review |
+|---|---|---|---|
+| `application_train` and `application_test` | Current application record | Treat application fields as point-in-time inputs unless the dictionary indicates otherwise | Exclude `TARGET` from predictors; use `SK_ID_CURR` only as an identifier |
+| `bureau` | `DAYS_CREDIT`, `DAYS_CREDIT_UPDATE` | Require credit origination and the latest observed bureau update to be on or before the current application | A positive contractual `DAYS_CREDIT_ENDDATE` may be known at application and is not automatically leakage |
+| `bureau_balance` | `MONTHS_BALANCE` | Use monthly records at or before the current application | Review month `0` separately because reporting timing within the application month may be ambiguous |
+| `previous_application` | `DAYS_DECISION` | Require the previous decision to occur on or before the current application | Separate scheduled dates from realized events; review `DAYS_FIRST_DRAWING`, `DAYS_LAST_DUE`, and `DAYS_TERMINATION` for post-application activity and sentinel values |
+| `POS_CASH_balance` | `MONTHS_BALANCE` | Use balance and delinquency snapshots at or before the current application | Review month `0` separately |
+| `credit_card_balance` | `MONTHS_BALANCE` | Use balance, utilization, payment, and delinquency snapshots at or before the current application | Review month `0` separately |
+| `installments_payments` | `DAYS_INSTALMENT`, `DAYS_ENTRY_PAYMENT` | Payment-behavior features must use payments observed by the current application date | Future scheduled installments may be known, but future actual payments must not be used as realized behavior |
+
+The EDA will report how many records pass, fail, or remain ambiguous under each rule before historical features are created.
+
+Ambiguous fields will not be used automatically. They will be placed under review until their business meaning and timing can be established.
+
+## Field Interpretability Inventory
+
+The EDA will produce a field-level interpretability inventory with the following columns:
+
+| Column | Purpose |
+|---|---|
+| Field | Original field name |
+| Table | Source table |
+| Plain-language meaning | Business interpretation based on the supplied dictionary and observed values |
+| Decision-time availability | Available, unavailable, ambiguous, or not applicable |
+| Use status | Candidate predictor, aggregation field, identifier-only, excluded, or governance review |
+| Reason | Explanation for the assigned status |
+
+This inventory will provide an audit trail between the raw data, exploratory findings, feature engineering, and later model explanations.
+
+It will also support an adverse-action or reason-code layer by ensuring that candidate predictors can be translated into understandable business concepts.
+
+## Model-Metric Alignment
+
+The Business Problem Statement identifies ROC-AUC of at least 0.79 as the primary model-performance criterion.
+
+The other metrics referenced in the industry research serve different purposes:
+
+- **ROC-AUC:** primary measure of risk-ranking performance
+- **Gini:** alternative expression of ranking discrimination derived from ROC-AUC
+- **KS statistic:** secondary separation diagnostic
+- **Precision-recall:** minority-outcome diagnostic when payment difficulty is uncommon
+- **Calibration:** determines whether predicted probabilities match observed risk
+- **Population Stability Index:** monitors population change rather than predictive accuracy
+
+These metrics will not be treated as competing primary success criteria. During EDA, they will only guide target assessment, population comparison, and later evaluation design.
+
+## Baseline and Success-Criterion Validation
+
+Before the Business Problem Statement’s numerical targets are treated as established baselines, the project will verify:
+
+1. The observed payment-difficulty rate in `application_train`
+2. Whether the stated 8% baseline is supported by that observed rate
+3. Whether ROC-AUC ≥ 0.79 is a course requirement, competition benchmark, or selected project target
+4. Whether the 10% relative approval-rate lift is supported by a business source or is an aspirational scenario
+
+The project will use the term **payment-difficulty rate** for the observed `TARGET` rate. It will not describe the rate as a regulatory default rate unless the target definition can be aligned with an applicable regulatory definition.
+
+Because the dataset does not include complete approval-policy, pricing, recovery, and cost information, an approval-rate lift cannot be validated directly during EDA. It may be retained as a later scenario-analysis objective if clearly labeled as an assumption.
+
+### Cost-Asymmetry Input
+
+The relative business cost of a false approval and a false decline has not yet been provided.
+
+For this project:
+
+- A **false approval** occurs when an applicant is classified as safe but later experiences payment difficulty.
+- A **false decline** occurs when an applicant is classified as risky but would have repaid successfully.
+
+The project will define:
+
+\[
+N =
+\frac{\text{Cost of a false approval}}
+{\text{Cost of a false decline}}
+\]
+
+Using the false-decline cost as one relative cost unit, the later threshold analysis will evaluate:
+
+\[
+\text{Total relative cost}
+=
+N \times \text{False approvals}
++
+1 \times \text{False declines}
+\]
+
+`N` is an unresolved stakeholder input. It must be supplied or represented by an approved scenario range before model-threshold recommendations are made.
+
+ROC-AUC remains useful for comparing ranking performance, but it does not select an operating threshold or account for asymmetric decision costs.
+
+## Data Sources
+
+| Source | Analytical role | Planned use |
+|---|---|---|
+| `application_train` | Applicant-level development data | Target analysis and applicant-level EDA |
+| `application_test` | Future scoring population | Train/test population comparison |
+| `bureau` | External credit history | Bureau account and debt aggregates |
+| `bureau_balance` | Monthly bureau history | Status, delinquency, and recency aggregates |
+| `previous_application` | Previous Home Credit applications | Prior decision, product, and amount history |
+| `POS_CASH_balance` | Monthly POS and cash-loan behavior | Balance, installment, and delinquency behavior |
+| `credit_card_balance` | Monthly credit-card behavior | Utilization, drawing, payment, and delinquency behavior |
+| `installments_payments` | Installment-payment records | Lateness, underpayment, and repayment consistency |
+| `HomeCredit_columns_description` | Supplied data dictionary | Field interpretation and coded-value documentation |
+| `sample_submission` | Submission structure | Validation of the test population and required output |
+
+## Relational-Coverage Decisions
+
+The Data Map identified unmatched historical identifiers. These records will not be silently discarded or automatically treated as invalid.
+
+| Child table | Observed issue | Working hypothesis | Planned handling |
+|---|---|---|---|
+| `bureau_balance` | Some `SK_ID_BUREAU` values do not appear in `bureau` | The monthly-history extract may include bureau records outside the supplied parent-table scope | Retain audit counts; records without a matching bureau parent cannot be assigned to `SK_ID_CURR` and will not enter applicant-level features |
+| `POS_CASH_balance` | Some `SK_ID_PREV` values do not appear in `previous_application` | The history table may include contracts whose original application record is outside the supplied previous-application extract | Test direct `SK_ID_CURR` coverage and aggregate directly by `SK_ID_CURR` when valid |
+| `credit_card_balance` | Some `SK_ID_PREV` values do not appear in `previous_application` | The account-history and application extracts may have different scopes | Test direct `SK_ID_CURR` coverage and avoid requiring an inner join through `previous_application` |
+| `installments_payments` | Some `SK_ID_PREV` values do not appear in `previous_application` | Payment history may cover loans whose application record is not supplied | Test direct `SK_ID_CURR` coverage and aggregate directly when valid |
+
+These explanations are hypotheses, not confirmed causes. The EDA will test:
+
+- Whether unmatched child records contain valid `SK_ID_CURR` values
+- Whether those current IDs exist in the train or test population
+- How many applicants and records would be lost under an inner join
+- Whether direct and parent-mediated aggregation produce different coverage
+- Whether unmatched records have systematically different values
+
+The selected aggregation route will be documented for each table before features are created.
+
+## Known Limitations
+
+The EDA will explicitly account for the following limitations:
+
+- The country and legal jurisdiction are not identified.
+- The dataset does not provide usable calendar dates.
+- Currency units are not documented.
+- The exact observation and performance periods are not disclosed.
+- The exact `TARGET` delinquency thresholds are anonymized.
+- Repayment outcomes may only represent originated loans.
+- Rejected applicants may not be represented in the outcome population.
+- Historical tables contain unmatched relationship keys.
+- Missing values may represent no history, non-applicability, or non-collection.
+- Bureau records may be affected by reporting delays.
+- Loan products have different risk structures.
+- Pricing, recovery, loss severity, and operating-cost data are unavailable.
+- Expected loss, profitability, and loss given default cannot be calculated directly.
+- Calendar seasonality and macroeconomic effects cannot be established from the supplied data.
+- Decision-time availability is not fully documented for every historical field.
+- Numerical success criteria in the Business Problem Statement require source or data validation.
+- The relative cost of a false approval versus a false decline has not been supplied.
+- The supplied data dictionary (219 rows) may not cover every column present in the raw files; a dictionary-completeness check will be run before relying on it for field interpretation.
+
+## Planned Analytical Techniques
+
+### Univariate Analysis
+
+- Counts and proportions
+- Means, medians, and quantiles
+- Standard deviations and robust spread measures
+- Histograms and density plots
+- Boxplots
+- Category-frequency tables
+- Rare-level identification
+
+### Bivariate Analysis
+
+- Target rates by category
+- Numeric distributions by target
+- Binned risk summaries
+- Cross-tabulations
+- Grouped boxplots and density plots
+- Appropriate numeric and categorical association measures
+
+### Missingness Analysis
+
+- Field-level missing counts and rates
+- Row-level missingness
+- Co-missingness patterns
+- Missingness by product and target
+- Structural versus unexplained missingness
+
+### Outlier and Range Review
+
+- Minimum and maximum values
+- Quantile-based checks
+- Interquartile-range review
+- Domain-based validity checks
+- Sentinel and placeholder detection
+- Comparison of extreme values across tables
+- Cross-field date-logic checks (for example, `DAYS_LAST_DUE` occurring before `DAYS_FIRST_DUE`) to catch impossible orderings beyond the known `365243` sentinel
+- Systematic co-occurrence checks between anomalous values in a field and other fields (category, status, or product), rather than reporting sentinel prevalence in isolation
+
+Outliers will be logged before any decision is made to cap, transform, or exclude them.
+
+### Relationship, Timing, and Aggregation Checks
+
+- Single-column and composite-key uniqueness
+- Join coverage
+- One-to-many relationship validation
+- Unmatched-key investigation
+- Comparative profiling of matched versus unmatched keys—not just counting them—to determine whether they should be retained, flagged, or excluded from aggregation
+- Direct versus parent-mediated aggregation coverage
+- Decision-time eligibility counts
+- Post-application and ambiguous-record counts
+- Applicant-level row-count validation
+- Duplicate detection after aggregation
+- Reconciliation of source and aggregated counts
+- Documentation of the selected aggregation route
+
+### Train/Test Comparison
+
+- Distribution comparisons
+- Category-share differences
+- Missingness differences
+- Product-mix differences
+- Population stability measures
+
+## Analytical Guardrails
+
+The EDA will follow these principles:
+
+- Separate observation from interpretation.
+- Do not treat association as causation.
+- Do not remove or correct values before documenting them.
+- Do not use identifier fields as predictors.
+- Avoid using information unavailable at the application decision point.
+- Compare loan products before combining them.
+- Document missingness before selecting a treatment.
+- Retain an audit trail for exclusions and transformations.
+- Evaluate business usefulness alongside statistical strength.
+- Flag fairness, privacy, and explainability concerns.
+
+## Tools and Environment
+
+The analysis will be developed using:
+
+- **Programming language:** R
+- **Development environment:** Positron
+- **Reporting framework:** Quarto
+- **Large-data query engine:** DuckDB
+- **Visualization:** R visualization packages selected during implementation
+- **Version control:** Git and GitHub
+- **Publishing:** GitHub Pages
+
+Reusable functions will be stored in `R/`, raw data will remain in `data/raw/`, processed analytical tables will be stored in `data/processed/`, and generated figures and tables will be stored in `outputs/`.
+
+## Expected Deliverables
+
+The EDA phase will produce:
+
+1. A reproducible Quarto HTML report
+2. A documented data-quality and missingness assessment
+3. A decision-time availability audit for every historical table
+4. A field-level interpretability inventory
+5. A documented relational-coverage decision for every child table
+6. Applicant and loan-population profiles
+7. Target-rate and risk-segment summaries
+8. Historical credit and payment-behavior summaries
+9. Train/test population comparisons
+10. Business-focused figures and tables
+11. A documented list of leakage, fairness, and governance risks
+12. Recommendations for feature engineering and modeling
+13. Validation of the BPS baseline and success-criterion assumptions
+14. Clear separation between business findings and technical evidence
+15. A documented cost-asymmetry assumption or stakeholder-approved scenario range for threshold evaluation
+
+Detailed R code will remain visible but collapsible so that the primary report remains accessible to a business audience.
+
+## Completion Criteria
+
+The EDA will be considered complete when:
+
+- Every analytical table has been profiled.
+- Important fields have documented meanings, units, and coded values.
+- Every candidate field has a decision-time availability classification.
+- Every candidate field has a documented use status and plain-language meaning.
+- Missingness and quality issues have been logged.
+- Relative-date and leakage rules have been applied.
+- Unmatched historical identifiers have documented handling decisions.
+- Historical tables have validated applicant-level aggregation strategies.
+- Business questions have evidence-based findings.
+- The observed payment-difficulty baseline has been calculated.
+- The BPS success criteria have documented sources or assumption labels.
+- Train/test differences have been assessed.
+- Potential leakage, fairness, and governance risks have been identified.
+- Findings have been translated into implications for modeling and business decision-making.
+- The false-approval versus false-decline cost ratio, or an approved scenario range, has been documented before threshold selection.

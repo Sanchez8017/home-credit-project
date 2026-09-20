@@ -12,6 +12,7 @@
 # Quarto generated files
 .quarto/
 _site/
+_reports_site/
 *_files/
 *.html
 site_libs/

@@ -3,7 +3,10 @@ project:
   output-dir: _site
   execute-dir: project
   render:
-    - "*.qmd"
+    - "index.qmd"
+    - "01_data_map.qmd"
+    - "02_industry_context.qmd"
+    - "03_eda_plan.qmd"
 
 website:
   title: "Home Credit Project Portfolio"
@@ -13,6 +16,10 @@ website:
         text: Home
       - href: 01_data_map.qmd
         text: Data Map
+      - href: 02_industry_context.qmd
+        text: Industry Context
+      - href: 03_eda_plan.qmd
+        text: EDA Plan
 
 format:
   html:

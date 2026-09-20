@@ -1,0 +1,1681 @@
+---
+title: "Home Credit Exploratory Data Analysis"
+author: "Alejo Sanchez"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show analysis code"
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(DBI)
+library(duckdb)
+library(knitr)
+
+project_root <- if (dir.exists(file.path("data", "raw"))) "." else ".."
+raw_dir <- normalizePath(file.path(project_root, "data", "raw"), winslash = "/")
+table_names <- c(
+  "application_train", "application_test", "bureau", "bureau_balance",
+  "previous_application", "POS_CASH_balance", "credit_card_balance",
+  "installments_payments", "sample_submission"
+)
+
+con <- dbConnect(duckdb(), dbdir = ":memory:")
+
+for (table_name in table_names) {
+  csv_path <- gsub("'", "''", file.path(raw_dir, paste0(table_name, ".csv")), fixed = TRUE)
+  dbExecute(
+    con,
+    sprintf(
+      "CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s', header = true)",
+      dbQuoteIdentifier(con, table_name), csv_path
+    )
+  )
+}
+
+qname <- function(x) as.character(dbQuoteIdentifier(con, x))
+sql_table <- function(x) qname(x)
+run_sql <- function(sql) dbGetQuery(con, sql)
+fmt_int <- function(x) format(round(as.numeric(x)), big.mark = ",", scientific = FALSE)
+fmt_pct <- function(x, digits = 2) sprintf(paste0("%.", digits, "f%%"), 100 * as.numeric(x))
+
+dictionary <- read.csv(
+  file.path(raw_dir, "HomeCredit_columns_description.csv"),
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "latin1"
+)
+names(dictionary)[1] <- "dictionary_row"
+
+schema_for <- function(table_name) {
+  out <- run_sql(sprintf("DESCRIBE %s", sql_table(table_name)))
+  data.frame(
+    table = table_name,
+    column = out$column_name,
+    raw_type = out$column_type,
+    stringsAsFactors = FALSE
+  )
+}
+
+schemas <- do.call(rbind, lapply(table_names, schema_for))
+
+table_captions <- c(
+  data_inventory = "Raw data inventory",
+  coverage_summary = "Dictionary coverage by analytical table",
+  undocumented_columns = "Raw columns requiring dictionary review",
+  dictionary_reverse_audit = "Dictionary entries absent from raw schemas",
+  ambiguous_dictionary = "Column names with conflicting dictionary descriptions",
+  grain_audit = "Observed keys and expected grain by table",
+  submission_reconciliation = "Sample-submission and scoring-population ID reconciliation",
+  exact_duplicates = "Exact duplicate audit by table",
+  installment_multiplicity = "Multiplicity of scheduled-installment groups",
+  installment_repeat_detail = "Within-group comparison of repeated scheduled installments",
+  installment_null_detail = "Pending-payment patterns within repeated scheduled installments",
+  relationship_audit = "Foreign-key relationship audit",
+  direct_routes = "Coverage of direct applicant-key routes",
+  orphan_overlap = "Overlap among unmatched previous-loan keys",
+  target_output = "Training outcome distribution",
+  categorical_summary = "Categorical-level standardization and placeholder audit",
+  placeholder_disposition = "Column-level disposition of placeholder categories",
+  reject_reason_context = "Reject-reason placeholder by previous-application status",
+  category_difference = "Category levels appearing in only one application population",
+  missing_output = "Field-level null rates across analytical tables",
+  target_missing_output = "Largest missing-versus-observed TARGET-rate differences",
+  history_target = "TARGET rates by availability of each historical source",
+  combined_history_target = "TARGET rate by combined historical-data coverage",
+  bureau_depth_target = "TARGET rate by bureau-record depth",
+  delinquency_target = "TARGET rates by prior delinquency indicator",
+  credit_card_delinquency_sensitivity = "Credit-card TARGET rates across maximum delinquency bands",
+  contradictions = "Values that contradict dictionary descriptions",
+  date_logic = "Cross-field previous-application date-order checks",
+  xna_counts = "Column-specific use of the XNA placeholder",
+  decision_time_inventory = "Decision-time inclusion rules by source",
+  temporal_audit = "Observed temporal-direction exceptions",
+  future_realized = "Post-application previous-loan outcomes",
+  future_sentinel_context = "Sentinel and future-date patterns in previous applications",
+  missing_compare = "Largest train/test missingness differences",
+  numeric_compare = "Selected train/test median comparisons",
+  numeric_profile = "Robust numeric range and outlier profile",
+  plausibility_audit = "Business-plausibility checks for numeric fields",
+  metric_summary = "Repayment-capacity proxy summaries by contract type",
+  affordability_target = "TARGET rate across affordability-proxy quintiles",
+  metric_definitions = "Definitions and limitations of business-metric proxies",
+  segment_sizes = "Training sample and TARGET counts by applicant segment",
+  fairness_review = "Fairness and proxy-discrimination review",
+  power_inputs_required = "Inputs still required for statistical power calculations",
+  final_review = "Remaining gaps and planned analytical controls"
+)
+
+kable_clean <- function(x, caption = NULL, digits = 3) {
+  if (is.null(caption)) {
+    expression <- deparse(substitute(x), width.cutoff = 500)
+    key <- sub("\\[.*$", "", expression)
+    caption <- unname(table_captions[key])
+    if (!length(caption) || is.na(caption)) caption <- "Analysis results"
+  }
+  knitr::kable(x, caption = caption, digits = digits, row.names = FALSE)
+}
+```
+
+# Introduction
+
+## Business problem
+
+The [Home Credit Business Problem Statement](../references/Home%20Credit%20Business%20Problem%20Statement.docx) states that Home Credit serves applicants who may be able to afford a loan but lack the traditional credit history required to demonstrate it. This creates two linked risks: creditworthy applicants may be declined, while applicants unable to repay may be approved and later default. The project therefore seeks to predict payment difficulty from application, historical, bureau, and suitable non-bureau information so Home Credit can expand responsible access to credit while controlling repayment risk.
+
+The BPS proposes two later success criteria: an AUC-ROC of at least 0.79 and a 10% relative increase in approvals for creditworthy applicants without traditional credit history while maintaining the default rate at or below an approximately 8% historical baseline. This EDA can verify the observed `TARGET` baseline and data feasibility; it cannot verify approval-rate lift because current approval decisions, rejected applicants, and the operating threshold are not supplied.
+
+## Analytical purpose
+
+This notebook establishes the modeling population, audits the supplied tables, identifies decision-time-safe information, compares train and test, and describes initial relationships with payment difficulty. Results are descriptive and do not establish causation.
+
+# Description of Data
+
+```{r}
+#| label: data-inventory
+
+# Count rows and columns for each source without loading the CSVs into R memory.
+data_inventory <- do.call(rbind, lapply(table_names, function(table_name) {
+  data.frame(
+    table = table_name,
+    rows = as.numeric(run_sql(sprintf("SELECT COUNT(*) AS n FROM %s", sql_table(table_name)))$n),
+    columns = sum(schemas$table == table_name),
+    stringsAsFactors = FALSE
+  )
+}))
+kable_clean(data_inventory)
+```
+
+The supplied data consists of two application populations, external bureau history, previous Home Credit applications, three monthly or event-level repayment sources, and a submission template. The application tables are applicant-level; every historical source is one-to-many and must be aggregated before it can be joined to an applicant-level modeling table.
+
+## What each table represents
+
+| Table | Business meaning | Main field families |
+|---|---|---|
+| `application_train` | Current loan applicants with the observed payment-difficulty outcome (`TARGET`) | Applicant demographics and household composition; employment and income; requested credit, annuity, and goods price; housing and asset indicators; contact and document flags; external risk scores; application timing |
+| `application_test` | Current applicants to be scored, with the same application information but no observed `TARGET` | The same application-time families as the training table |
+| `bureau` | Credit facilities reported by external credit bureaus for a current applicant | Credit type and status; origination and update dates; credit limits, balances, overdue amounts, and delinquency history |
+| `bureau_balance` | Monthly status history for an external bureau facility | Relative month and monthly account-status code |
+| `previous_application` | Earlier Home Credit applications made by a current applicant | Prior product and contract type; approval status; requested and granted amounts; pricing and payment terms; channel and seller; decision and lifecycle dates |
+| `POS_CASH_balance` | Monthly performance of earlier point-of-sale or cash loans | Relative month, installment progress, remaining installments, contract status, and delinquency measures |
+| `credit_card_balance` | Monthly performance of earlier Home Credit credit-card accounts | Balance, limit, drawings, receivables, payments, installment obligations, status, and delinquency measures |
+| `installments_payments` | Recorded payment events against scheduled installments on earlier Home Credit loans | Scheduled installment identity; scheduled and actual payment dates; scheduled and paid amounts |
+| `sample_submission` | Required output layout for the test population | Applicant identifier and prediction placeholder |
+
+: Table descriptions and principal field families
+
+The application tables therefore describe the applicant and requested loan at the modeling anchor. The remaining analytical tables describe prior credit relationships over time. Their columns should not be treated as additional applicant rows: dates, amounts, statuses, and delinquency measures must first be filtered to information available at application time and then summarized to `SK_ID_CURR`.
+
+# Data Integrity
+
+## Standing checks
+
+Each standing check is executed once in its linked canonical question below. The hidden chunks in this subsection prepare shared audit objects so later sections display one result rather than rerunning the same analysis.
+
+### Target distribution
+
+```{r}
+#| label: standing-target
+#| include: false
+
+# Count applicants in each outcome class and convert the counts to shares.
+target_distribution <- run_sql("
+  SELECT
+    TARGET,
+    COUNT(*) AS applicants,
+    COUNT(*) / SUM(COUNT(*)) OVER () AS share
+  FROM application_train
+  GROUP BY TARGET
+  ORDER BY TARGET
+")
+```
+
+Reported once in [Question 5](#what-is-the-distribution-of-target-in-the-training-population-added).
+
+### Missingness: how much, and does it relate to the target?
+
+```{r}
+#| label: standing-missingness
+#| include: false
+#| fig-width: 12
+#| fig-height: 9
+
+# Build one null-count query per table so the large CSVs remain in DuckDB.
+missing_summary <- function(table_name) {
+  schema <- schemas[schemas$table == table_name, ]
+  expressions <- vapply(schema$column, function(column_name) {
+    column_sql <- qname(column_name)
+    sprintf("COUNT(*) FILTER (WHERE %s IS NULL) AS %s", column_sql, qname(column_name))
+  }, character(1))
+  counts <- run_sql(sprintf(
+    "SELECT COUNT(*) AS n_rows, %s FROM %s",
+    paste(expressions, collapse = ", "), sql_table(table_name)
+  ))
+  data.frame(
+    table = table_name,
+    column = schema$column,
+    missing = as.numeric(counts[1, schema$column]),
+    rows = as.numeric(counts$n_rows),
+    stringsAsFactors = FALSE
+  )
+}
+
+missingness_all <- do.call(rbind, lapply(table_names[1:8], missing_summary))
+missingness_all$missing_rate <- missingness_all$missing / missingness_all$rows
+```
+
+Reported once in [Question 7](#which-columns-have-a-high-percentage-of-null-or-missing-values-and-does-missingness-relate-to-target).
+
+### Impossible values
+
+```{r}
+#| label: standing-impossible
+#| include: false
+
+# Count the known sentinel and positive-relative-date exceptions without recoding them.
+impossible_values <- run_sql("
+  SELECT 'application_train' AS table_name, 'DAYS_EMPLOYED' AS field,
+         '365243 sentinel' AS rule, COUNT(*) AS affected_rows
+  FROM application_train WHERE DAYS_EMPLOYED = 365243
+  UNION ALL
+  SELECT 'application_test', 'DAYS_EMPLOYED', '365243 sentinel', COUNT(*)
+  FROM application_test WHERE DAYS_EMPLOYED = 365243
+  UNION ALL
+  SELECT 'bureau', 'DAYS_CREDIT_UPDATE', 'positive relative day', COUNT(*)
+  FROM bureau WHERE DAYS_CREDIT_UPDATE > 0
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_FIRST_DRAWING', '365243 sentinel', COUNT(*)
+  FROM previous_application WHERE DAYS_FIRST_DRAWING = 365243
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_FIRST_DUE', '365243 sentinel', COUNT(*)
+  FROM previous_application WHERE DAYS_FIRST_DUE = 365243
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_LAST_DUE_1ST_VERSION', '365243 sentinel', COUNT(*)
+  FROM previous_application WHERE DAYS_LAST_DUE_1ST_VERSION = 365243
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_LAST_DUE', '365243 sentinel', COUNT(*)
+  FROM previous_application WHERE DAYS_LAST_DUE = 365243
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_TERMINATION', '365243 sentinel', COUNT(*)
+  FROM previous_application WHERE DAYS_TERMINATION = 365243
+")
+```
+
+Reported once in [Question 8](#are-there-values-in-the-dataset-that-explicitly-contradict-the-provided-data-dictionary).
+
+### Keys, duplicates, and the grain of each table
+
+```{r}
+#| label: standing-keys
+#| include: false
+
+# Define the row-level identifier or proposed composite key for each table.
+key_definitions <- list(
+  application_train = c("SK_ID_CURR"),
+  application_test = c("SK_ID_CURR"),
+  bureau = c("SK_ID_BUREAU"),
+  bureau_balance = c("SK_ID_BUREAU", "MONTHS_BALANCE"),
+  previous_application = c("SK_ID_PREV"),
+  POS_CASH_balance = c("SK_ID_PREV", "MONTHS_BALANCE"),
+  credit_card_balance = c("SK_ID_PREV", "MONTHS_BALANCE"),
+  installments_payments = c("SK_ID_PREV", "NUM_INSTALMENT_VERSION", "NUM_INSTALMENT_NUMBER"),
+  sample_submission = c("SK_ID_CURR")
+)
+
+key_audit_one <- function(table_name, keys) {
+  key_sql <- paste(vapply(keys, qname, character(1)), collapse = ", ")
+  missing_rule <- paste(sprintf("%s IS NULL", vapply(keys, qname, character(1))), collapse = " OR ")
+  overall <- run_sql(sprintf(
+    "SELECT COUNT(*) AS rows, COUNT(DISTINCT (%s)) AS distinct_keys,
+            COUNT(*) FILTER (WHERE %s) AS missing_key_rows
+     FROM %s", key_sql, missing_rule, sql_table(table_name)
+  ))
+  max_group <- run_sql(sprintf(
+    "SELECT MAX(n) AS max_group_size FROM
+       (SELECT COUNT(*) AS n FROM %s GROUP BY %s)",
+    sql_table(table_name), key_sql
+  ))$max_group_size
+  data.frame(
+    table = table_name,
+    candidate_key = paste(keys, collapse = " + "),
+    rows = as.numeric(overall$rows),
+    distinct_keys = as.numeric(overall$distinct_keys),
+    missing_key_rows = as.numeric(overall$missing_key_rows),
+    max_group_size = as.numeric(max_group),
+    stringsAsFactors = FALSE
+  )
+}
+
+key_audit <- do.call(rbind, Map(key_audit_one, names(key_definitions), key_definitions))
+key_audit$status <- ifelse(
+  key_audit$rows == key_audit$distinct_keys & key_audit$missing_key_rows == 0,
+  "Unique", "Review"
+)
+```
+
+Reported across [Question 2](#do-the-unique-row-counts-at-the-primary-key-level-align-with-the-expected-grain-of-the-data) and [Question 3](#are-there-any-duplicate-records-that-should-not-exist).
+
+### Temporal direction: what was known at application time?
+
+```{r}
+#| label: standing-temporal
+#| include: false
+
+# Count records after time zero and records exactly at time zero for each anchor.
+temporal_audit <- run_sql("
+  SELECT 'bureau' AS table_name, 'DAYS_CREDIT' AS anchor,
+    COUNT(*) AS rows, COUNT(*) FILTER (WHERE DAYS_CREDIT > 0) AS future_rows,
+    COUNT(*) FILTER (WHERE DAYS_CREDIT = 0) AS ambiguous_zero_rows
+  FROM bureau
+  UNION ALL
+  SELECT 'bureau', 'DAYS_CREDIT_UPDATE', COUNT(*),
+    COUNT(*) FILTER (WHERE DAYS_CREDIT_UPDATE > 0),
+    COUNT(*) FILTER (WHERE DAYS_CREDIT_UPDATE = 0)
+  FROM bureau
+  UNION ALL
+  SELECT 'bureau_balance', 'MONTHS_BALANCE', COUNT(*),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE > 0),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE = 0)
+  FROM bureau_balance
+  UNION ALL
+  SELECT 'previous_application', 'DAYS_DECISION', COUNT(*),
+    COUNT(*) FILTER (WHERE DAYS_DECISION > 0),
+    COUNT(*) FILTER (WHERE DAYS_DECISION = 0)
+  FROM previous_application
+  UNION ALL
+  SELECT 'POS_CASH_balance', 'MONTHS_BALANCE', COUNT(*),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE > 0),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE = 0)
+  FROM POS_CASH_balance
+  UNION ALL
+  SELECT 'credit_card_balance', 'MONTHS_BALANCE', COUNT(*),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE > 0),
+    COUNT(*) FILTER (WHERE MONTHS_BALANCE = 0)
+  FROM credit_card_balance
+  UNION ALL
+  SELECT 'installments_payments', 'DAYS_ENTRY_PAYMENT', COUNT(*),
+    COUNT(*) FILTER (WHERE DAYS_ENTRY_PAYMENT > 0),
+    COUNT(*) FILTER (WHERE DAYS_ENTRY_PAYMENT = 0)
+  FROM installments_payments
+")
+```
+
+Reported once in [Question 9](#which-fields-and-historical-records-were-known-at-the-current-application-decision-time-added).
+
+### Train/test consistency in columns and category levels
+
+```{r}
+#| label: standing-train-test
+#| include: false
+
+# Compare train and test schemas, allowing TARGET to be train-only.
+train_schema <- schemas[schemas$table == "application_train", c("column", "raw_type")]
+test_schema <- schemas[schemas$table == "application_test", c("column", "raw_type")]
+schema_comparison <- merge(
+  train_schema, test_schema, by = "column", all = TRUE,
+  suffixes = c("_train", "_test")
+)
+schema_comparison$status <- ifelse(
+  is.na(schema_comparison$raw_type_test), "Train only",
+  ifelse(is.na(schema_comparison$raw_type_train), "Test only",
+         ifelse(schema_comparison$raw_type_train == schema_comparison$raw_type_test,
+                "Same type", "Type differs"))
+)
+
+# Check important shared categorical fields for levels present in only one population.
+shared_categories <- c(
+  "NAME_CONTRACT_TYPE", "CODE_GENDER", "NAME_INCOME_TYPE",
+  "NAME_EDUCATION_TYPE", "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE",
+  "OCCUPATION_TYPE", "ORGANIZATION_TYPE"
+)
+category_difference <- do.call(rbind, lapply(shared_categories, function(field) {
+  run_sql(sprintf("
+    WITH train AS (SELECT %1$s AS value, COUNT(*) AS train_n FROM application_train GROUP BY %1$s),
+         test AS (SELECT %1$s AS value, COUNT(*) AS test_n FROM application_test GROUP BY %1$s)
+    SELECT '%2$s' AS field, COALESCE(train.value, test.value) AS value,
+           COALESCE(train_n, 0) AS train_n, COALESCE(test_n, 0) AS test_n
+    FROM train FULL JOIN test ON train.value = test.value
+    WHERE train_n IS NULL OR test_n IS NULL
+  ", qname(field), field))
+}))
+```
+
+Reported once in [Question 10](#are-training-and-test-schemas-category-levels-and-missingness-patterns-consistent-added).
+
+# Exploratory Results
+
+The following analyses answer the 13 approved questions in dependency order. Each standing check is displayed here once, under its corresponding question.
+
+## 1. Does the supplied dictionary cover every raw column, and do the raw schemas support the documented field interpretations? [added]
+
+```{r}
+#| label: q1-dictionary
+
+# Map each raw analytical field to the dictionary table label that should describe it.
+dictionary_tables <- list(
+  application_train = "application_{train|test}.csv",
+  application_test = "application_{train|test}.csv",
+  bureau = "bureau.csv",
+  bureau_balance = "bureau_balance.csv",
+  previous_application = "previous_application.csv",
+  POS_CASH_balance = "POS_CASH_balance.csv",
+  credit_card_balance = "credit_card_balance.csv",
+  installments_payments = "installments_payments.csv"
+)
+
+# Normalize surrounding whitespace before deciding whether a dictionary field matches.
+dictionary$Row_clean <- trimws(dictionary$Row)
+dictionary$Description_clean <- trimws(dictionary$Description)
+dictionary_descriptions <- aggregate(
+  Description_clean ~ Row_clean,
+  dictionary,
+  function(x) length(unique(x))
+)
+ambiguous_names <- dictionary_descriptions$Row_clean[
+  dictionary_descriptions$Description_clean > 1
+]
+
+dictionary_coverage <- do.call(rbind, lapply(names(dictionary_tables), function(table_name) {
+  observed <- schemas[schemas$table == table_name, ]
+  documented <- unique(dictionary$Row_clean[dictionary$Table == dictionary_tables[[table_name]]])
+  data.frame(
+    table = table_name,
+    column = observed$column,
+    raw_type = observed$raw_type,
+    dictionary_match = ifelse(
+      !observed$column %in% documented,
+      "Undocumented",
+      ifelse(observed$column %in% ambiguous_names, "Ambiguously mapped", "Documented")
+    ),
+    stringsAsFactors = FALSE
+  )
+}))
+
+coverage_summary <- aggregate(
+  column ~ table + dictionary_match,
+  dictionary_coverage, length
+)
+names(coverage_summary)[names(coverage_summary) == "column"] <- "columns"
+kable_clean(coverage_summary)
+
+undocumented_columns <- dictionary_coverage[
+  dictionary_coverage$dictionary_match %in% c("Undocumented", "Ambiguously mapped"),
+]
+kable_clean(undocumented_columns)
+
+# Audit the dictionary in the reverse direction so stale specifications are visible.
+dictionary_reverse_audit <- do.call(rbind, lapply(names(dictionary_tables), function(table_name) {
+  documented <- unique(dictionary$Row_clean[dictionary$Table == dictionary_tables[[table_name]]])
+  observed <- schemas$column[schemas$table == table_name]
+  data.frame(
+    table = table_name,
+    dictionary_column = documented,
+    status = ifelse(documented %in% observed, "Present in raw schema", "Documented but absent"),
+    stringsAsFactors = FALSE
+  )
+}))
+dictionary_reverse_audit <- dictionary_reverse_audit[
+  dictionary_reverse_audit$status == "Documented but absent", 
+]
+kable_clean(dictionary_reverse_audit)
+
+# Flag reused column names whose dictionary descriptions differ across tables.
+ambiguous_dictionary <- dictionary[
+  dictionary$Row_clean %in% ambiguous_names,
+  c("Table", "Row", "Description")
+]
+kable_clean(ambiguous_dictionary)
+```
+
+The output checks all four planned cases: documented raw columns, undocumented raw columns, dictionary entries absent from the files, and column names with different descriptions across tables.
+
+The two-way audit is more revealing than the original coverage count. After trimming dictionary field names, `SK_ID_PREV` matches correctly, but the bureau specification still uses `SK_BUREAU_ID` while the files use `SK_ID_BUREAU`. `TARGET` being absent from `application_test` is intentional because the dictionary combines train and test in one specification; `NFLAG_MICRO_CASH` is a genuinely documented-but-absent field. Reused names with different descriptions aren't automatically errors, but they need table-qualified interpretations.
+
+**Decision:** I'll use identifier fields only for joins and leave them out of the predictor set. I’ll maintain a dictionary-exception register for spelling mismatches, intentionally train-only fields, stale entries, and table-specific meanings instead of calling every mismatch “undocumented.”
+
+## 2. Do the unique row counts at the primary-key level align with the expected grain of the data?
+
+```{r}
+#| label: q2-grain
+
+# Attach the business grain descriptions to the key-audit results computed above.
+grain_labels <- c(
+  application_train = "one training application",
+  application_test = "one scoring application",
+  bureau = "one external bureau credit record",
+  bureau_balance = "one bureau record-month",
+  previous_application = "one previous application",
+  POS_CASH_balance = "one POS/cash loan-month",
+  credit_card_balance = "one credit-card account-month",
+  installments_payments = "one recorded payment event; scheduled grouping tested",
+  sample_submission = "one test application"
+)
+grain_audit <- key_audit
+grain_audit$expected_grain <- unname(grain_labels[grain_audit$table])
+kable_clean(grain_audit[, c(
+  "table", "expected_grain", "candidate_key", "rows", "distinct_keys",
+  "missing_key_rows", "max_group_size", "status"
+)])
+
+# Confirm that the required prediction IDs and scoring-table IDs match exactly.
+submission_reconciliation <- run_sql("
+  SELECT
+    (SELECT COUNT(*) FROM sample_submission) AS submission_rows,
+    (SELECT COUNT(*) FROM application_test) AS test_rows,
+    (SELECT COUNT(*) FROM sample_submission s
+      LEFT JOIN application_test t USING (SK_ID_CURR)
+      WHERE t.SK_ID_CURR IS NULL) AS submission_ids_missing_from_test,
+    (SELECT COUNT(*) FROM application_test t
+      LEFT JOIN sample_submission s USING (SK_ID_CURR)
+      WHERE s.SK_ID_CURR IS NULL) AS test_ids_missing_from_submission
+")
+kable_clean(submission_reconciliation)
+```
+
+The output shows whether each proposed key is complete and unique and whether the sample-submission and test ID sets match exactly.
+
+None of the proposed key fields are missing, which makes the joins and later aggregations much more dependable. The submission reconciliation also checks whether every required prediction ID has a scoring row and vice versa. The installment table is the one wrinkle. Its scheduled-installment grouping isn't unique, but that alone doesn't mean the extra rows are duplicates; it may simply reflect multiple payments against one scheduled installment.
+
+**Decision:** I'll enforce the verified keys for the application, bureau, previous-application, and monthly-balance tables. For `installments_payments`, I'll treat each row as a payment event and aggregate those events deliberately instead of forcing the schedule grouping to be unique.
+
+## 3. Are there any duplicate records that should not exist?
+
+```{r}
+#| label: q3-duplicates
+#| cache: false
+
+# Group by every source column to identify exact duplicate records.
+exact_duplicate_one <- function(table_name) {
+  all_columns <- schemas$column[schemas$table == table_name]
+  all_columns_sql <- paste(vapply(all_columns, qname, character(1)), collapse = ", ")
+  result <- run_sql(sprintf("
+    WITH grouped AS (
+      SELECT COUNT(*) AS group_size
+      FROM %s
+      GROUP BY %s
+    )
+    SELECT
+      COUNT(*) FILTER (WHERE group_size > 1) AS duplicate_groups,
+      COALESCE(SUM(group_size - 1) FILTER (WHERE group_size > 1), 0) AS excess_rows,
+      MAX(group_size) AS maximum_group_size
+    FROM grouped
+  ", sql_table(table_name), all_columns_sql))
+  data.frame(table = table_name, result, check.names = FALSE)
+}
+
+exact_duplicates <- do.call(rbind, lapply(table_names, exact_duplicate_one))
+kable_clean(exact_duplicates)
+
+# Audit scheduled-installment multiplicity separately because split payments can be valid.
+installment_multiplicity <- run_sql("
+  SELECT
+    COUNT(*) AS scheduled_groups,
+    COUNT(*) FILTER (WHERE n > 1) AS repeated_scheduled_groups,
+    COALESCE(SUM(n - 1) FILTER (WHERE n > 1), 0) AS excess_payment_rows,
+    MAX(n) AS maximum_group_size
+  FROM (
+    SELECT SK_ID_PREV, NUM_INSTALMENT_VERSION, NUM_INSTALMENT_NUMBER, COUNT(*) AS n
+    FROM installments_payments
+    GROUP BY ALL
+  )
+")
+kable_clean(installment_multiplicity)
+
+# Compare fields within repeated scheduled-installment groups to distinguish
+# separate payment events from conflicting schedule records.
+installment_repeat_detail <- run_sql("
+  WITH repeated AS (
+    SELECT
+      SK_ID_PREV,
+      NUM_INSTALMENT_VERSION,
+      NUM_INSTALMENT_NUMBER,
+      COUNT(*) AS payment_rows,
+      COUNT(DISTINCT COALESCE(CAST(DAYS_ENTRY_PAYMENT AS VARCHAR), '<NULL>')) AS distinct_payment_dates,
+      COUNT(DISTINCT COALESCE(CAST(AMT_PAYMENT AS VARCHAR), '<NULL>')) AS distinct_payment_amounts,
+      COUNT(DISTINCT COALESCE(CAST(DAYS_INSTALMENT AS VARCHAR), '<NULL>')) AS distinct_due_dates,
+      COUNT(DISTINCT COALESCE(CAST(AMT_INSTALMENT AS VARCHAR), '<NULL>')) AS distinct_scheduled_amounts
+    FROM installments_payments
+    GROUP BY ALL
+    HAVING COUNT(*) > 1
+  )
+  SELECT
+    COUNT(*) AS repeated_scheduled_groups,
+    COUNT(*) FILTER (
+      WHERE distinct_payment_dates > 1 OR distinct_payment_amounts > 1
+    ) AS groups_with_distinct_payment_events,
+    COUNT(*) FILTER (
+      WHERE distinct_due_dates > 1 OR distinct_scheduled_amounts > 1
+    ) AS groups_with_conflicting_schedule_fields,
+    COUNT(*) FILTER (
+      WHERE distinct_payment_dates = 1 AND distinct_payment_amounts = 1
+        AND distinct_due_dates = 1 AND distinct_scheduled_amounts = 1
+    ) AS groups_identical_on_compared_fields
+  FROM repeated
+")
+kable_clean(installment_repeat_detail)
+
+# Separate genuine paid-event multiplicity from groups containing a pending/null payment row.
+installment_null_detail <- run_sql("
+  WITH repeated AS (
+    SELECT
+      SK_ID_PREV,
+      NUM_INSTALMENT_VERSION,
+      NUM_INSTALMENT_NUMBER,
+      COUNT(*) AS rows_in_group,
+      COUNT(*) FILTER (WHERE DAYS_ENTRY_PAYMENT IS NULL OR AMT_PAYMENT IS NULL) AS pending_rows,
+      COUNT(DISTINCT DAYS_ENTRY_PAYMENT) FILTER (WHERE DAYS_ENTRY_PAYMENT IS NOT NULL) AS paid_dates,
+      COUNT(DISTINCT AMT_PAYMENT) FILTER (WHERE AMT_PAYMENT IS NOT NULL) AS paid_amounts
+    FROM installments_payments
+    GROUP BY ALL
+    HAVING COUNT(*) > 1
+  )
+  SELECT
+    COUNT(*) AS repeated_groups,
+    COUNT(*) FILTER (WHERE pending_rows > 0) AS groups_with_pending_rows,
+    COUNT(*) FILTER (
+      WHERE pending_rows = 0 AND (paid_dates > 1 OR paid_amounts > 1)
+    ) AS groups_with_multiple_observed_payments,
+    COUNT(*) FILTER (
+      WHERE pending_rows > 0 AND (paid_dates > 0 OR paid_amounts > 0)
+    ) AS groups_mixing_pending_and_observed,
+    COUNT(*) FILTER (
+      WHERE pending_rows = rows_in_group
+    ) AS groups_all_pending
+  FROM repeated
+")
+kable_clean(installment_null_detail)
+```
+
+The output shows exact duplicate groups, repeated scheduled-installment groups, differences within those groups, and whether null payment fields are creating false evidence of multiple payments.
+
+I didn't find any exact duplicate rows. That's reassuring, and it also means a blanket deduplication step would do more harm than good. All 640,905 repeated installment groups have multiple observed payment dates or amounts, and none contains a null payment row. The distinction isn't being created by a paid row paired with an unpaid schedule line. The 653,483 excess rows really do behave like separate payment events.
+
+**Decision:** I won't deduplicate these rows. At the applicant level, I'll summarize total `AMT_PAYMENT`, the number of payment events, the latest `DAYS_ENTRY_PAYMENT`, and the differences between scheduled and actual amounts and timing. I'll keep a schedule-conflict flag too, even though this check found no conflicts.
+
+## 4. Are there any orphaned foreign keys that could break or bias data-model relationships?
+
+```{r}
+#| label: q4-foreign-keys
+
+# Create the complete set of current applicant IDs used as the parent population.
+dbExecute(con, "
+  CREATE TEMP TABLE current_ids AS
+  SELECT SK_ID_CURR FROM application_train
+  UNION
+  SELECT SK_ID_CURR FROM application_test
+")
+
+# Count unmatched rows and keys for each documented parent-child relationship.
+relationship_sql <- "
+  SELECT 'bureau' AS child, 'SK_ID_CURR' AS child_key, 'current applications' AS parent,
+    COUNT(*) FILTER (WHERE p.SK_ID_CURR IS NULL) AS unmatched_rows,
+    COUNT(DISTINCT c.SK_ID_CURR) FILTER (WHERE p.SK_ID_CURR IS NULL) AS unmatched_keys
+  FROM bureau c LEFT JOIN current_ids p USING (SK_ID_CURR)
+  UNION ALL
+  SELECT 'bureau_balance', 'SK_ID_BUREAU', 'bureau',
+    COUNT(*) FILTER (WHERE p.SK_ID_BUREAU IS NULL),
+    COUNT(DISTINCT c.SK_ID_BUREAU) FILTER (WHERE p.SK_ID_BUREAU IS NULL)
+  FROM bureau_balance c LEFT JOIN bureau p USING (SK_ID_BUREAU)
+  UNION ALL
+  SELECT 'previous_application', 'SK_ID_CURR', 'current applications',
+    COUNT(*) FILTER (WHERE p.SK_ID_CURR IS NULL),
+    COUNT(DISTINCT c.SK_ID_CURR) FILTER (WHERE p.SK_ID_CURR IS NULL)
+  FROM previous_application c LEFT JOIN current_ids p USING (SK_ID_CURR)
+  UNION ALL
+  SELECT 'POS_CASH_balance', 'SK_ID_PREV', 'previous_application',
+    COUNT(*) FILTER (WHERE p.SK_ID_PREV IS NULL),
+    COUNT(DISTINCT c.SK_ID_PREV) FILTER (WHERE p.SK_ID_PREV IS NULL)
+  FROM POS_CASH_balance c LEFT JOIN previous_application p USING (SK_ID_PREV)
+  UNION ALL
+  SELECT 'credit_card_balance', 'SK_ID_PREV', 'previous_application',
+    COUNT(*) FILTER (WHERE p.SK_ID_PREV IS NULL),
+    COUNT(DISTINCT c.SK_ID_PREV) FILTER (WHERE p.SK_ID_PREV IS NULL)
+  FROM credit_card_balance c LEFT JOIN previous_application p USING (SK_ID_PREV)
+  UNION ALL
+  SELECT 'installments_payments', 'SK_ID_PREV', 'previous_application',
+    COUNT(*) FILTER (WHERE p.SK_ID_PREV IS NULL),
+    COUNT(DISTINCT c.SK_ID_PREV) FILTER (WHERE p.SK_ID_PREV IS NULL)
+  FROM installments_payments c LEFT JOIN previous_application p USING (SK_ID_PREV)
+"
+relationship_audit <- run_sql(relationship_sql)
+kable_clean(relationship_audit)
+
+# Test direct applicant routes for historical tables that also carry SK_ID_CURR.
+direct_routes <- run_sql("
+  SELECT 'POS_CASH_balance' AS child,
+    COUNT(*) FILTER (WHERE p.SK_ID_CURR IS NULL) AS unmatched_current_rows
+  FROM POS_CASH_balance c LEFT JOIN current_ids p USING (SK_ID_CURR)
+  UNION ALL
+  SELECT 'credit_card_balance', COUNT(*) FILTER (WHERE p.SK_ID_CURR IS NULL)
+  FROM credit_card_balance c LEFT JOIN current_ids p USING (SK_ID_CURR)
+  UNION ALL
+  SELECT 'installments_payments', COUNT(*) FILTER (WHERE p.SK_ID_CURR IS NULL)
+  FROM installments_payments c LEFT JOIN current_ids p USING (SK_ID_CURR)
+")
+kable_clean(direct_routes)
+
+# Determine whether unmatched previous-loan keys describe one shared population
+# or different provenance gaps across the three child tables.
+orphan_overlap <- run_sql("
+  WITH
+  pos AS (
+    SELECT DISTINCT c.SK_ID_PREV FROM POS_CASH_balance c
+    LEFT JOIN previous_application p USING (SK_ID_PREV)
+    WHERE p.SK_ID_PREV IS NULL
+  ),
+  card AS (
+    SELECT DISTINCT c.SK_ID_PREV FROM credit_card_balance c
+    LEFT JOIN previous_application p USING (SK_ID_PREV)
+    WHERE p.SK_ID_PREV IS NULL
+  ),
+  inst AS (
+    SELECT DISTINCT c.SK_ID_PREV FROM installments_payments c
+    LEFT JOIN previous_application p USING (SK_ID_PREV)
+    WHERE p.SK_ID_PREV IS NULL
+  )
+  SELECT 'POS and card' AS comparison,
+    (SELECT COUNT(*) FROM pos JOIN card USING (SK_ID_PREV)) AS shared_keys
+  UNION ALL
+  SELECT 'POS and installments',
+    (SELECT COUNT(*) FROM pos JOIN inst USING (SK_ID_PREV))
+  UNION ALL
+  SELECT 'card and installments',
+    (SELECT COUNT(*) FROM card JOIN inst USING (SK_ID_PREV))
+  UNION ALL
+  SELECT 'all three',
+    (SELECT COUNT(*) FROM pos JOIN card USING (SK_ID_PREV) JOIN inst USING (SK_ID_PREV))
+")
+kable_clean(orphan_overlap)
+```
+
+The output shows unmatched child rows and keys, coverage on the direct applicant routes, and overlap among unmatched `SK_ID_PREV` populations.
+
+The unmatched `SK_ID_PREV` and `SK_ID_BUREAU` populations aren't trivial. They also aren't three independent problems. POS and installments share 28,647 unmatched previous-loan keys, while card and installments share 10,195; POS and card share none. That points to at least two source-specific provenance patterns. I can still recover the applicant relationship through `SK_ID_CURR` for POS, card, and installments, but I shouldn't count the orphan totals as unrelated defects. Unmatched bureau-balance rows remain different because they have no direct applicant key.
+
+## 5. What is the distribution of `TARGET` in the training population? [added]
+
+```{r}
+#| label: q5-target
+
+# Present the target audit prepared for the standing check without rerunning it.
+target_output <- target_distribution
+target_output$percent <- round(100 * target_output$share, 3)
+target_output$share <- NULL
+kable_clean(target_output)
+
+barplot(
+  target_output$applicants,
+  names.arg = target_output$TARGET,
+  xlab = "TARGET", ylab = "Applicants",
+  main = "Training target distribution",
+  col = c("#3C8DBC", "#D9534F")
+)
+```
+
+The output shows the applicant count and percentage for each training outcome class.
+
+Payment difficulty is the minority outcome, but it isn't vanishingly rare. There are still 24,825 positive cases to learn from. The class imbalance matters, though, so I won't judge a model by accuracy alone; stratified validation and ranking metrics will be more informative.
+
+## 6. Are the categorical variables standardized enough to be used as clean drop-down slicers?
+
+```{r}
+#| label: q6-categories
+
+# Summarize raw levels, normalized levels, and placeholder use in one scan per table.
+categorical_summary_one <- function(table_name) {
+  char_fields <- schemas$column[
+    schemas$table == table_name & grepl("VARCHAR", schemas$raw_type)
+  ]
+  if (!length(char_fields)) return(NULL)
+  expressions <- unlist(lapply(char_fields, function(field) {
+    f <- qname(field)
+    c(
+      sprintf("COUNT(DISTINCT %s) AS %s", f, qname(paste0(field, "__raw"))),
+      sprintf("COUNT(DISTINCT LOWER(TRIM(%s))) AS %s", f, qname(paste0(field, "__norm"))),
+      sprintf("COUNT(*) FILTER (WHERE UPPER(TRIM(%s)) IN ('XNA','XAP','UNKNOWN')) AS %s",
+              f, qname(paste0(field, "__placeholder")))
+    )
+  }))
+  wide <- run_sql(sprintf("SELECT %s FROM %s", paste(expressions, collapse = ", "), sql_table(table_name)))
+  do.call(rbind, lapply(char_fields, function(field) {
+    data.frame(
+      table = table_name,
+      field = field,
+      raw_levels = as.numeric(wide[[paste0(field, "__raw")]]),
+      normalized_levels = as.numeric(wide[[paste0(field, "__norm")]]),
+      placeholder_rows = as.numeric(wide[[paste0(field, "__placeholder")]]),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+categorical_summary <- do.call(rbind, lapply(table_names[1:8], categorical_summary_one))
+categorical_summary$normalization_collision <- categorical_summary$raw_levels != categorical_summary$normalized_levels
+kable_clean(categorical_summary)
+
+kable_clean(category_difference)
+
+# Give every observed placeholder field an explicit, column-level treatment.
+placeholder_disposition <- categorical_summary[categorical_summary$placeholder_rows > 0, ]
+placeholder_disposition$placeholder_share <- placeholder_disposition$placeholder_rows /
+  vapply(placeholder_disposition$table, function(x) {
+    as.numeric(run_sql(sprintf("SELECT COUNT(*) AS n FROM %s", sql_table(x)))$n)
+  }, numeric(1))
+placeholder_disposition$disposition <- ifelse(
+  placeholder_disposition$field == "CODE_REJECT_REASON",
+  "Keep XAP as structural not-applicable; validate against contract status",
+  ifelse(
+    placeholder_disposition$field %in% c(
+      "NAME_GOODS_CATEGORY", "NAME_PORTFOLIO", "NAME_PRODUCT_TYPE",
+      "NAME_SELLER_INDUSTRY", "NAME_YIELD_GROUP"
+    ),
+    "Keep placeholder as a structural category and retain an indicator",
+    "Map to field-specific unknown category and retain an indicator"
+  )
+)
+kable_clean(placeholder_disposition[, c(
+  "table", "field", "placeholder_rows", "placeholder_share", "disposition"
+)])
+
+# Check whether XAP reject reasons align with applications that were not refused.
+reject_reason_context <- run_sql("
+  SELECT NAME_CONTRACT_STATUS,
+    COUNT(*) AS applications,
+    COUNT(*) FILTER (WHERE CODE_REJECT_REASON = 'XAP') AS xap_rows,
+    AVG(CASE WHEN CODE_REJECT_REASON = 'XAP' THEN 1.0 ELSE 0.0 END) AS xap_share
+  FROM previous_application
+  GROUP BY NAME_CONTRACT_STATUS
+  ORDER BY applications DESC
+")
+kable_clean(reject_reason_context)
+```
+
+The output shows categorical normalization, train/test-only levels, a disposition for every observed placeholder field, and how `CODE_REJECT_REASON = XAP` aligns with previous-application status.
+
+I expected to find more categories that differed only because of capitalization or extra spaces, but that problem isn't widespread here. The placeholder audit is more useful. `CODE_REJECT_REASON = XAP` appears in essentially every approved or canceled previous application and almost never in refused applications, so it behaves like “not applicable,” not a missing rejection reason. The other high-volume placeholder fields now have their own dispositions in the table instead of being covered by one general promise.
+
+**Decision:** I'll preserve the recorded labels and handle structural placeholders one column at a time. The allowed levels will come from the training data, and any new test or future value will go into an explicit `OTHER_UNSEEN` category instead of disappearing silently.
+
+## 7. Which columns have a high percentage of null or missing values, and does missingness relate to `TARGET`?
+
+```{r}
+#| label: q7-missingness
+#| fig-width: 12
+#| fig-height: 9
+
+# Plot the fields with the largest null shares using the shared missingness audit.
+standing_missing <- head(missingness_all[order(-missingness_all$missing_rate), ], 15)
+old_par <- par(mar = c(5, 18, 4, 2))
+barplot(
+  rev(standing_missing$missing_rate),
+  names.arg = rev(paste(standing_missing$table, standing_missing$column, sep = ": ")),
+  horiz = TRUE,
+  las = 1,
+  xlab = "Share of rows that are null",
+  ylab = "Table and field",
+  main = "Fields with the highest null shares",
+  col = "#3C8DBC",
+  cex.names = 0.7
+)
+par(old_par)
+
+# Present the complete field-level null inventory in descending order.
+missing_output <- missingness_all[order(-missingness_all$missing_rate), ]
+missing_output$missing_rate <- fmt_pct(missing_output$missing_rate)
+kable_clean(missing_output)
+
+# Build missing-versus-observed TARGET comparisons for every application field.
+application_fields <- schemas$column[
+  schemas$table == "application_train" &
+    !schemas$column %in% c("SK_ID_CURR", "TARGET")
+]
+target_missing_expr <- unlist(lapply(application_fields, function(field) {
+  f <- qname(field)
+  c(
+    sprintf("COUNT(*) FILTER (WHERE %s IS NULL) AS %s", f, qname(paste0(field, "__n"))),
+    sprintf("AVG(TARGET) FILTER (WHERE %s IS NULL) AS %s", f, qname(paste0(field, "__miss"))),
+    sprintf("AVG(TARGET) FILTER (WHERE %s IS NOT NULL) AS %s", f, qname(paste0(field, "__obs")))
+  )
+}))
+target_missing_wide <- run_sql(sprintf(
+  "SELECT %s FROM application_train", paste(target_missing_expr, collapse = ", ")
+))
+target_missing_all <- do.call(rbind, lapply(application_fields, function(field) {
+  data.frame(
+    field = field,
+    missing_n = as.numeric(target_missing_wide[[paste0(field, "__n")]]),
+    missing_target_rate = as.numeric(target_missing_wide[[paste0(field, "__miss")]]),
+    observed_target_rate = as.numeric(target_missing_wide[[paste0(field, "__obs")]]),
+    stringsAsFactors = FALSE
+  )
+}))
+target_missing_all$absolute_rate_gap <- abs(
+  target_missing_all$missing_target_rate - target_missing_all$observed_target_rate
+)
+target_missing_output <- target_missing_all[
+  target_missing_all$missing_n > 0 & !is.na(target_missing_all$absolute_rate_gap),
+]
+target_missing_output <- head(target_missing_output[order(-target_missing_output$absolute_rate_gap), ], 25)
+kable_clean(target_missing_output)
+
+# Compare TARGET rates for applicants with and without each historical source.
+history_target <- run_sql("
+  SELECT source, has_history, COUNT(*) AS applicants, AVG(TARGET) AS target_rate
+  FROM (
+    SELECT a.SK_ID_CURR, a.TARGET, 'bureau' AS source,
+      EXISTS (SELECT 1 FROM bureau b WHERE b.SK_ID_CURR = a.SK_ID_CURR) AS has_history
+    FROM application_train a
+    UNION ALL
+    SELECT a.SK_ID_CURR, a.TARGET, 'previous_application',
+      EXISTS (SELECT 1 FROM previous_application p WHERE p.SK_ID_CURR = a.SK_ID_CURR)
+    FROM application_train a
+    UNION ALL
+    SELECT a.SK_ID_CURR, a.TARGET, 'POS_CASH_balance',
+      EXISTS (SELECT 1 FROM POS_CASH_balance p WHERE p.SK_ID_CURR = a.SK_ID_CURR)
+    FROM application_train a
+    UNION ALL
+    SELECT a.SK_ID_CURR, a.TARGET, 'credit_card_balance',
+      EXISTS (SELECT 1 FROM credit_card_balance c WHERE c.SK_ID_CURR = a.SK_ID_CURR)
+    FROM application_train a
+    UNION ALL
+    SELECT a.SK_ID_CURR, a.TARGET, 'installments_payments',
+      EXISTS (SELECT 1 FROM installments_payments i WHERE i.SK_ID_CURR = a.SK_ID_CURR)
+    FROM application_train a
+  ) x
+  GROUP BY source, has_history
+  ORDER BY source, has_history
+")
+kable_clean(history_target)
+
+# Build the strict cross-source no-history segment requested by the BPS review.
+combined_history_target <- run_sql("
+  WITH
+  b AS (SELECT DISTINCT SK_ID_CURR FROM bureau),
+  p AS (SELECT DISTINCT SK_ID_CURR FROM previous_application),
+  pos AS (SELECT DISTINCT SK_ID_CURR FROM POS_CASH_balance),
+  card AS (SELECT DISTINCT SK_ID_CURR FROM credit_card_balance),
+  inst AS (SELECT DISTINCT SK_ID_CURR FROM installments_payments),
+  flags AS (
+    SELECT a.SK_ID_CURR, a.TARGET,
+      (b.SK_ID_CURR IS NOT NULL)::INT + (p.SK_ID_CURR IS NOT NULL)::INT +
+      (pos.SK_ID_CURR IS NOT NULL)::INT + (card.SK_ID_CURR IS NOT NULL)::INT +
+      (inst.SK_ID_CURR IS NOT NULL)::INT AS sources_present
+    FROM application_train a
+    LEFT JOIN b USING (SK_ID_CURR)
+    LEFT JOIN p USING (SK_ID_CURR)
+    LEFT JOIN pos USING (SK_ID_CURR)
+    LEFT JOIN card USING (SK_ID_CURR)
+    LEFT JOIN inst USING (SK_ID_CURR)
+  )
+  SELECT CASE
+      WHEN sources_present = 0 THEN 'No history in any source'
+      WHEN sources_present = 5 THEN 'History in all five sources'
+      ELSE 'History in some sources'
+    END AS history_coverage,
+    COUNT(*) AS applicants,
+    AVG(TARGET) AS target_rate
+  FROM flags
+  GROUP BY 1
+  ORDER BY applicants DESC
+")
+kable_clean(combined_history_target)
+
+# Separate no bureau history from sparse and deeper bureau files.
+bureau_depth_target <- run_sql("
+  WITH depth AS (
+    SELECT a.SK_ID_CURR, a.TARGET, COUNT(b.SK_ID_BUREAU) AS bureau_records
+    FROM application_train a
+    LEFT JOIN bureau b USING (SK_ID_CURR)
+    GROUP BY a.SK_ID_CURR, a.TARGET
+  )
+  SELECT CASE
+      WHEN bureau_records = 0 THEN 'No bureau records'
+      WHEN bureau_records = 1 THEN '1 bureau record'
+      WHEN bureau_records BETWEEN 2 AND 4 THEN '2-4 bureau records'
+      ELSE '5+ bureau records'
+    END AS bureau_depth,
+    COUNT(*) AS applicants,
+    AVG(TARGET) AS target_rate
+  FROM depth
+  GROUP BY 1
+  ORDER BY MIN(bureau_records)
+")
+kable_clean(bureau_depth_target)
+
+# Compare decision-time-safe prior delinquency indicators with TARGET by source.
+delinquency_target <- run_sql("
+  WITH source_flags AS (
+    SELECT SK_ID_CURR, 'bureau' AS source,
+      TRUE AS has_source,
+      BOOL_OR(CREDIT_DAY_OVERDUE >= 30 OR COALESCE(AMT_CREDIT_SUM_OVERDUE, 0) > 0) AS delinquent
+    FROM bureau GROUP BY SK_ID_CURR
+    UNION ALL
+    SELECT SK_ID_CURR, 'POS_CASH_balance', TRUE,
+      BOOL_OR(SK_DPD >= 30 OR SK_DPD_DEF >= 30)
+    FROM POS_CASH_balance WHERE MONTHS_BALANCE < 0 GROUP BY SK_ID_CURR
+    UNION ALL
+    SELECT SK_ID_CURR, 'credit_card_balance', TRUE,
+      BOOL_OR(SK_DPD >= 30 OR SK_DPD_DEF >= 30)
+    FROM credit_card_balance WHERE MONTHS_BALANCE < 0 GROUP BY SK_ID_CURR
+    UNION ALL
+    SELECT SK_ID_CURR, 'installments_payments', TRUE,
+      BOOL_OR(DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT >= 30)
+    FROM installments_payments
+    WHERE DAYS_ENTRY_PAYMENT <= 0 AND DAYS_INSTALMENT <= 0
+    GROUP BY SK_ID_CURR
+  ),
+  sources AS (
+    SELECT * FROM (VALUES ('bureau'), ('POS_CASH_balance'),
+      ('credit_card_balance'), ('installments_payments')) v(source)
+  )
+  SELECT s.source,
+    CASE WHEN f.has_source IS NULL THEN 'No source history'
+         WHEN f.delinquent THEN 'Prior delinquency observed'
+         ELSE 'History, no measured delinquency' END AS history_state,
+    COUNT(*) AS applicants,
+    AVG(a.TARGET) AS target_rate
+  FROM application_train a
+  CROSS JOIN sources s
+  LEFT JOIN source_flags f ON a.SK_ID_CURR = f.SK_ID_CURR AND s.source = f.source
+  GROUP BY s.source, history_state
+  ORDER BY s.source, history_state
+")
+kable_clean(delinquency_target)
+
+# Test whether the reversed credit-card result depends on the 30-day cutoff
+# by separating applicants into maximum observed delinquency bands.
+credit_card_delinquency_sensitivity <- run_sql("
+  WITH cc AS (
+    SELECT SK_ID_CURR,
+      MAX(SK_DPD) AS max_dpd,
+      MAX(SK_DPD_DEF) AS max_dpd_def
+    FROM credit_card_balance
+    WHERE MONTHS_BALANCE < 0
+    GROUP BY SK_ID_CURR
+  )
+  SELECT CASE
+      WHEN cc.SK_ID_CURR IS NULL THEN 'No credit-card history'
+      WHEN max_dpd = 0 THEN '0 days'
+      WHEN max_dpd BETWEEN 1 AND 29 THEN '1-29 days'
+      WHEN max_dpd BETWEEN 30 AND 59 THEN '30-59 days'
+      WHEN max_dpd BETWEEN 60 AND 89 THEN '60-89 days'
+      ELSE '90+ days'
+    END AS maximum_dpd_band,
+    COUNT(*) AS applicants,
+    AVG(a.TARGET) AS target_rate,
+    AVG(CASE WHEN COALESCE(max_dpd_def, 0) >= 30 THEN 1.0 ELSE 0.0 END) AS share_with_dpd_def_30_plus
+  FROM application_train a
+  LEFT JOIN cc USING (SK_ID_CURR)
+  GROUP BY 1
+  ORDER BY CASE maximum_dpd_band
+    WHEN 'No credit-card history' THEN 0
+    WHEN '0 days' THEN 1
+    WHEN '1-29 days' THEN 2
+    WHEN '30-59 days' THEN 3
+    WHEN '60-89 days' THEN 4
+    ELSE 5 END
+")
+kable_clean(credit_card_delinquency_sensitivity)
+```
+
+The output shows field-level null rates, missing-versus-present target-rate gaps, combined and source-specific history coverage, bureau depth, and prior delinquency rates against `TARGET`.
+
+Some of the missingness gaps are too large to ignore. Applicants without a bureau record have a 10.1% observed target rate, compared with 7.7% for applicants with bureau history. Missing inquiry fields show a similar pattern: 10.3% versus 7.7%. That doesn't prove missing data causes repayment trouble, but it does tell me that “no history,” “field missing,” and “zero reported activity” shouldn't be collapsed into the same value.
+
+The strict thin-file result changes the story. Only 2,200 applicants have no records in any of the five historical sources, and their target rate is 7.1%—not higher than the full training baseline. The 10.1% result belongs specifically to applicants with no bureau records. Bureau depth adds more detail: applicants with one bureau record are at 8.6%, while those with two to four or five-plus records are around 7.5% to 7.6%. I won't use “no bureau record” as a synonym for “no history anywhere.”
+
+Payment behavior is more directly tied to risk. Prior bureau delinquency is associated with a 15.8% target rate versus 7.6% for bureau history without measured delinquency. Installment delinquency shows 10.5% versus 8.0%, and POS delinquency shows 9.6% versus 8.1%.
+
+The credit-card sensitivity check confirms the reversal instead of explaining it away. Applicants with zero maximum credit-card DPD have an 8.8% target rate, compared with 7.6% at 30–59 days and 6.5% at 90+ days. Only 3.7% of the 90+ raw-DPD group also has `SK_DPD_DEF` of at least 30 days, suggesting that raw DPD may include tolerated small-balance delinquency. Different observation lengths, account closure, or selection into credit-card history could also contribute. This is not a credible monotonic risk feature in its current form.
+
+The biggest-looking gaps for `AMT_ANNUITY`, family size, and last-phone-change are much less convincing. They come from only one to twelve missing rows. A dramatic percentage can be misleading with a denominator that small, so I won't let those tiny groups determine the feature policy.
+
+**Decision:** I'll keep separate indicators for a missing field, no source history, zero activity, and prior delinquency. Bureau, installment, and POS delinquency flags will move forward as candidate features because their target-rate direction is consistent with repayment risk. I will not promote the credit-card delinquency flag until its reversed direction is reproduced in validation and explained through delinquency severity, account status, observation length, or selection into credit-card history. Numeric imputation values will be learned from training data only, and tiny missing groups won't receive custom rules from unstable target rates.
+
+## 8. Are there values in the dataset that explicitly contradict the provided data dictionary?
+
+```{r}
+#| label: q8-contradictions
+
+# Pair the observed sentinel exceptions with the dictionary statements they conflict with.
+contradictions <- impossible_values
+contradictions$dictionary_conflict <- c(
+  "employment described as days before application",
+  "employment described as days before application",
+  "update described as days before application",
+  rep("undocumented sentinel in relative-day field", 5)
+)
+kable_clean(contradictions)
+
+# Test cross-field due-date ordering after excluding the known sentinel.
+date_logic <- run_sql("
+  SELECT 'DAYS_LAST_DUE before DAYS_FIRST_DUE' AS check_name, COUNT(*) AS affected_rows
+  FROM previous_application
+  WHERE DAYS_FIRST_DUE IS NOT NULL AND DAYS_LAST_DUE IS NOT NULL
+    AND DAYS_FIRST_DUE <> 365243 AND DAYS_LAST_DUE <> 365243
+    AND DAYS_LAST_DUE < DAYS_FIRST_DUE
+  UNION ALL
+  SELECT 'DAYS_LAST_DUE_1ST_VERSION before DAYS_FIRST_DUE', COUNT(*)
+  FROM previous_application
+  WHERE DAYS_FIRST_DUE IS NOT NULL AND DAYS_LAST_DUE_1ST_VERSION IS NOT NULL
+    AND DAYS_FIRST_DUE <> 365243 AND DAYS_LAST_DUE_1ST_VERSION <> 365243
+    AND DAYS_LAST_DUE_1ST_VERSION < DAYS_FIRST_DUE
+")
+kable_clean(date_logic)
+
+# Count the undocumented XNA placeholder separately in each affected field.
+xna_counts <- run_sql("
+  SELECT 'application_train' AS table_name, 'CODE_GENDER' AS field,
+    COUNT(*) FILTER (WHERE CODE_GENDER = 'XNA') AS xna_rows FROM application_train
+  UNION ALL SELECT 'previous_application', 'NAME_CONTRACT_TYPE',
+    COUNT(*) FILTER (WHERE NAME_CONTRACT_TYPE = 'XNA') FROM previous_application
+  UNION ALL SELECT 'previous_application', 'NAME_CLIENT_TYPE',
+    COUNT(*) FILTER (WHERE NAME_CLIENT_TYPE = 'XNA') FROM previous_application
+  UNION ALL SELECT 'previous_application', 'NAME_PORTFOLIO',
+    COUNT(*) FILTER (WHERE NAME_PORTFOLIO = 'XNA') FROM previous_application
+  UNION ALL SELECT 'previous_application', 'NAME_PRODUCT_TYPE',
+    COUNT(*) FILTER (WHERE NAME_PRODUCT_TYPE = 'XNA') FROM previous_application
+  UNION ALL SELECT 'previous_application', 'NAME_YIELD_GROUP',
+    COUNT(*) FILTER (WHERE NAME_YIELD_GROUP = 'XNA') FROM previous_application
+  UNION ALL SELECT 'POS_CASH_balance', 'NAME_CONTRACT_STATUS',
+    COUNT(*) FILTER (WHERE NAME_CONTRACT_STATUS = 'XNA') FROM POS_CASH_balance
+")
+kable_clean(xna_counts)
+```
+
+The output shows dictionary-conflicting sentinels, cross-field date-order counts, and per-column use of the undocumented `XNA` placeholder.
+
+Once I remove the sentinel, the tested due dates appear in a believable order. That makes me more comfortable using them after the timing rules are applied. `XNA` needs a different interpretation: it appears in more than one million `NAME_PRODUCT_TYPE` rows and over half a million `NAME_YIELD_GROUP` rows. At that scale, it looks more like a structural “not applicable” value than an occasional entry mistake.
+
+**Decision:** I'll replace `365243` with missing for numeric calculations but keep a field-specific flag showing where it occurred. I'll preserve `XNA` as a category when the contract status or type supports “not applicable.” Positive dates that conflict with the dictionary will stay out of decision-time predictors until the timing rule in Question 9 is applied.
+
+## 9. Which fields and historical records were known at the current-application decision time? [added]
+
+```{r}
+#| label: q9-temporal
+
+# State the decision-time anchor and operational inclusion rule for each source.
+decision_time_inventory <- data.frame(
+  table = c(
+    "application_train", "bureau", "bureau_balance", "previous_application",
+    "POS_CASH_balance", "credit_card_balance", "installments_payments"
+  ),
+  anchor = c(
+    "current application", "DAYS_CREDIT / DAYS_CREDIT_UPDATE", "MONTHS_BALANCE",
+    "DAYS_DECISION", "MONTHS_BALANCE", "MONTHS_BALANCE",
+    "DAYS_INSTALMENT / DAYS_ENTRY_PAYMENT"
+  ),
+  operational_rule = c(
+    "application-time fields; exclude TARGET and identifiers as predictors",
+    "origination and latest update must be at or before time zero",
+    "use months before time zero; review month zero",
+    "decision must be at or before time zero; separate scheduled and realized dates",
+    "use months before time zero; review month zero",
+    "use months before time zero; review month zero",
+    "actual payment must be observed by time zero; future schedule is not realized behavior"
+  ),
+  stringsAsFactors = FALSE
+)
+kable_clean(decision_time_inventory)
+kable_clean(temporal_audit)
+
+# Count future realized previous-application events after excluding the sentinel.
+future_realized <- run_sql("
+  SELECT 'previous_application.DAYS_LAST_DUE_1ST_VERSION' AS field,
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE_1ST_VERSION > 0 AND DAYS_LAST_DUE_1ST_VERSION <> 365243) AS future_rows
+  FROM previous_application
+  UNION ALL
+  SELECT 'previous_application.DAYS_LAST_DUE',
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE > 0 AND DAYS_LAST_DUE <> 365243)
+  FROM previous_application
+  UNION ALL
+  SELECT 'previous_application.DAYS_TERMINATION',
+    COUNT(*) FILTER (WHERE DAYS_TERMINATION > 0 AND DAYS_TERMINATION <> 365243)
+  FROM previous_application
+")
+kable_clean(future_realized)
+
+# Show whether zero future realized events are explained by sentinel coding.
+future_sentinel_context <- run_sql("
+  SELECT 'DAYS_LAST_DUE_1ST_VERSION' AS field,
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE_1ST_VERSION = 365243) AS sentinel_rows,
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE_1ST_VERSION IS NULL) AS null_rows,
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE_1ST_VERSION <= 0) AS realized_or_due_by_zero,
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE_1ST_VERSION > 0 AND DAYS_LAST_DUE_1ST_VERSION <> 365243) AS future_non_sentinel
+  FROM previous_application
+  UNION ALL
+  SELECT 'DAYS_LAST_DUE',
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE = 365243),
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE IS NULL),
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE <= 0),
+    COUNT(*) FILTER (WHERE DAYS_LAST_DUE > 0 AND DAYS_LAST_DUE <> 365243)
+  FROM previous_application
+  UNION ALL
+  SELECT 'DAYS_TERMINATION',
+    COUNT(*) FILTER (WHERE DAYS_TERMINATION = 365243),
+    COUNT(*) FILTER (WHERE DAYS_TERMINATION IS NULL),
+    COUNT(*) FILTER (WHERE DAYS_TERMINATION <= 0),
+    COUNT(*) FILTER (WHERE DAYS_TERMINATION > 0 AND DAYS_TERMINATION <> 365243)
+  FROM previous_application
+")
+kable_clean(future_sentinel_context)
+```
+
+The output shows each operational timing rule, future and time-zero records, and the sentinel/null context behind apparently clean future-event counts.
+
+The 224,392 positive, non-sentinel `DAYS_LAST_DUE_1ST_VERSION` values are scheduled dates after the current application. `DAYS_LAST_DUE` and `DAYS_TERMINATION` show zero future values, but that isn't reassuring evidence: each field also has 673,065 null rows plus more than 200,000 sentinel rows. In other words, their zero count mostly reflects how unrealized events are encoded. I will treat a future schedule as known intent only and exclude any realized event that wasn't observed by time zero.
+
+## 10. Are training and test schemas, category levels, and missingness patterns consistent? [added]
+
+```{r}
+#| label: q10-train-test
+#| fig-width: 12
+#| fig-height: 10
+
+# Reuse the schema and categorical exceptions from the standing check.
+kable_clean(
+  schema_comparison[schema_comparison$status != "Same type", ],
+  caption = "Train/test schema differences"
+)
+kable_clean(category_difference)
+
+# Rank shared fields by the absolute train/test difference in null rate.
+train_missing <- missingness_all[missingness_all$table == "application_train", c("column", "missing_rate")]
+test_missing <- missingness_all[missingness_all$table == "application_test", c("column", "missing_rate")]
+missing_compare <- merge(train_missing, test_missing, by = "column", suffixes = c("_train", "_test"))
+missing_compare$absolute_gap <- abs(missing_compare$missing_rate_train - missing_compare$missing_rate_test)
+missing_compare <- head(missing_compare[order(-missing_compare$absolute_gap), ], 20)
+kable_clean(missing_compare)
+
+# Plot the largest null-rate differences using percentage-point units.
+old_par <- par(mar = c(5, 15, 4, 2))
+barplot(
+  rev(100 * missing_compare$absolute_gap),
+  names.arg = rev(missing_compare$column),
+  horiz = TRUE,
+  las = 1,
+  xlab = "Absolute difference in null rate (percentage points)",
+  ylab = "Field",
+  main = "Largest train/test missingness differences",
+  col = "#5CB85C",
+  cex.names = 0.75
+)
+par(old_par)
+
+# Compare selected medians on fields shared by both populations.
+numeric_compare <- run_sql("
+  SELECT 'train' AS population,
+    quantile_cont(AMT_INCOME_TOTAL, 0.5) AS median_income,
+    quantile_cont(AMT_CREDIT, 0.5) AS median_credit,
+    quantile_cont(AMT_ANNUITY, 0.5) AS median_annuity,
+    quantile_cont(DAYS_BIRTH, 0.5) AS median_days_birth
+  FROM application_train
+  UNION ALL
+  SELECT 'test', quantile_cont(AMT_INCOME_TOTAL, 0.5),
+    quantile_cont(AMT_CREDIT, 0.5), quantile_cont(AMT_ANNUITY, 0.5),
+    quantile_cont(DAYS_BIRTH, 0.5)
+  FROM application_test
+")
+kable_clean(numeric_compare)
+```
+
+The output shows schema exceptions, train/test-only categorical levels, the largest missing-rate gaps and their plot, and selected median comparisons.
+
+The clearest train/test shift is the availability of `EXT_SOURCE_1`: 56.4% is missing in training, compared with 42.1% in test. That's a 14.3-point gap. Test applicants also report a higher median income and request less credit at the median. I can't assume the scoring population is just another random sample of training, so model performance will need to be checked across these shifted fields.
+
+## 11. Are there severe outliers or mixed distributions that will inflate variance and require adjustment later?
+
+```{r}
+#| label: q11-outliers
+
+# Select numeric application fields representing amounts, counts, dates, and external scores.
+profile_fields <- c(
+  "AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE",
+  "CNT_CHILDREN", "DAYS_BIRTH", "DAYS_EMPLOYED", "OWN_CAR_AGE",
+  "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"
+)
+
+# Calculate robust quantiles and range diagnostics without altering source values.
+numeric_profile <- do.call(rbind, lapply(profile_fields, function(field) {
+  # Remove the documented employment sentinel before every numeric summary.
+  f <- if (field == "DAYS_EMPLOYED") {
+    sprintf("NULLIF(%s, 365243)", qname(field))
+  } else {
+    qname(field)
+  }
+  result <- run_sql(sprintf("
+    SELECT
+      COUNT(%1$s) AS n,
+      MIN(%1$s) AS minimum,
+      quantile_cont(%1$s, 0.01) AS p01,
+      quantile_cont(%1$s, 0.25) AS q1,
+      quantile_cont(%1$s, 0.5) AS median,
+      quantile_cont(%1$s, 0.75) AS q3,
+      quantile_cont(%1$s, 0.99) AS p99,
+      MAX(%1$s) AS maximum,
+      AVG(%1$s) AS mean,
+      STDDEV_SAMP(%1$s) AS sd,
+      COUNT(*) FILTER (WHERE %1$s = 0) AS zero_rows
+    FROM application_train
+  ", f))
+  data.frame(field = field, result, check.names = FALSE)
+}))
+numeric_profile$iqr <- numeric_profile$q3 - numeric_profile$q1
+numeric_profile$outlier_1_5_iqr_low <- numeric_profile$minimum < numeric_profile$q1 - 1.5 * numeric_profile$iqr
+numeric_profile$outlier_1_5_iqr_high <- numeric_profile$maximum > numeric_profile$q3 + 1.5 * numeric_profile$iqr
+numeric_profile$far_outlier_3_iqr_low <- numeric_profile$minimum < numeric_profile$q1 - 3 * numeric_profile$iqr
+numeric_profile$far_outlier_3_iqr_high <- numeric_profile$maximum > numeric_profile$q3 + 3 * numeric_profile$iqr
+kable_clean(numeric_profile)
+
+# Keep statistical outlier rules separate from business-plausibility checks.
+plausibility_audit <- run_sql("
+  SELECT 'OWN_CAR_AGE > 50 years' AS check_name,
+    COUNT(*) FILTER (WHERE OWN_CAR_AGE > 50) AS affected_rows,
+    MAX(OWN_CAR_AGE) AS observed_maximum
+  FROM application_train
+  UNION ALL
+  SELECT 'CNT_CHILDREN > 20',
+    COUNT(*) FILTER (WHERE CNT_CHILDREN > 20), MAX(CNT_CHILDREN)
+  FROM application_train
+  UNION ALL
+  SELECT 'AMT_INCOME_TOTAL <= 0',
+    COUNT(*) FILTER (WHERE AMT_INCOME_TOTAL <= 0), MAX(AMT_INCOME_TOTAL)
+  FROM application_train
+  UNION ALL
+  SELECT 'DAYS_BIRTH >= 0',
+    COUNT(*) FILTER (WHERE DAYS_BIRTH >= 0), MAX(DAYS_BIRTH)
+  FROM application_train
+")
+kable_clean(plausibility_audit)
+
+# Plot the four primary amount distributions on their original scales.
+par(mfrow = c(2, 2))
+for (field in c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE")) {
+  values <- run_sql(sprintf(
+    "SELECT %s AS value FROM application_train WHERE %s IS NOT NULL",
+    qname(field), qname(field)
+  ))$value
+  hist(
+    values,
+    breaks = 50,
+    main = paste("Distribution of", field),
+    xlab = field,
+    ylab = "Number of applicants",
+    col = "#3C8DBC"
+  )
+}
+par(mfrow = c(1, 1))
+```
+
+The output shows sentinel-safe numeric profiles, standard 1.5×IQR and 3×IQR flags, separate business-plausibility checks, and the observed amount distributions.
+
+After removing `365243`, the employment profile looks like an actual duration again: its maximum is zero rather than 365,243, and its mean is no longer dominated by the sentinel. The amount fields are still strongly right-skewed. A separate plausibility check also catches 3,361 cars reported as more than 50 years old, including a maximum of 91. A statistical rule alone would miss the business question, so those records need review and sensitivity testing rather than automatic deletion.
+
+**Decision:** I won't remove an applicant just because a value is statistically extreme. I'll handle the known sentinel first, check hard business constraints separately, and compare raw, `log1p`, and training-derived capped versions of the skewed amounts during validation.
+
+## 12. What does the baseline distribution of primary business metrics look like?
+
+```{r}
+#| label: q12-business-metrics
+
+# Construct approved repayment-capacity proxies and summarize them by contract type.
+metric_summary <- run_sql("
+  WITH metrics AS (
+    SELECT
+      NAME_CONTRACT_TYPE,
+      AMT_CREDIT,
+      AMT_ANNUITY,
+      AMT_INCOME_TOTAL,
+      AMT_GOODS_PRICE,
+      AMT_ANNUITY / NULLIF(AMT_INCOME_TOTAL, 0) AS annuity_to_income,
+      AMT_CREDIT / NULLIF(AMT_INCOME_TOTAL, 0) AS credit_to_income,
+      AMT_CREDIT / NULLIF(AMT_GOODS_PRICE, 0) AS financing_to_goods
+    FROM application_train
+  )
+  SELECT
+    NAME_CONTRACT_TYPE,
+    COUNT(*) AS applicants,
+    median(AMT_CREDIT) AS median_credit,
+    median(AMT_ANNUITY) AS median_annuity,
+    median(AMT_INCOME_TOTAL) AS median_income,
+    median(AMT_GOODS_PRICE) AS median_goods_price,
+    median(annuity_to_income) AS median_annuity_to_income,
+    median(credit_to_income) AS median_credit_to_income,
+    median(financing_to_goods) AS median_financing_to_goods
+  FROM metrics
+  GROUP BY NAME_CONTRACT_TYPE
+  ORDER BY NAME_CONTRACT_TYPE
+")
+kable_clean(metric_summary)
+
+# Test how each affordability proxy relates to TARGET within contract type.
+affordability_target <- run_sql("
+  WITH long_metrics AS (
+    SELECT SK_ID_CURR, TARGET, NAME_CONTRACT_TYPE,
+      'annuity_to_income' AS metric,
+      AMT_ANNUITY / NULLIF(AMT_INCOME_TOTAL, 0) AS value
+    FROM application_train
+    UNION ALL
+    SELECT SK_ID_CURR, TARGET, NAME_CONTRACT_TYPE, 'credit_to_income',
+      AMT_CREDIT / NULLIF(AMT_INCOME_TOTAL, 0)
+    FROM application_train
+    UNION ALL
+    SELECT SK_ID_CURR, TARGET, NAME_CONTRACT_TYPE, 'financing_to_goods',
+      AMT_CREDIT / NULLIF(AMT_GOODS_PRICE, 0)
+    FROM application_train
+  ), ranked AS (
+    SELECT *, NTILE(5) OVER (
+      PARTITION BY metric, NAME_CONTRACT_TYPE ORDER BY value, SK_ID_CURR
+    ) AS within_product_quintile
+    FROM long_metrics
+    WHERE value IS NOT NULL
+  )
+  SELECT metric, NAME_CONTRACT_TYPE, within_product_quintile,
+    COUNT(*) AS applicants,
+    MIN(value) AS minimum_value,
+    MAX(value) AS maximum_value,
+    AVG(TARGET) AS target_rate
+  FROM ranked
+  GROUP BY metric, NAME_CONTRACT_TYPE, within_product_quintile
+  ORDER BY metric, NAME_CONTRACT_TYPE, within_product_quintile
+")
+kable_clean(affordability_target)
+
+# Plot median requested credit by current contract type.
+barplot(
+  metric_summary$median_credit,
+  names.arg = metric_summary$NAME_CONTRACT_TYPE,
+  xlab = "Current contract type",
+  ylab = "Median AMT_CREDIT",
+  main = "Median requested credit by contract type",
+  col = "#F0AD4E"
+)
+
+# Document the exact construction used for every displayed business metric.
+metric_definitions <- data.frame(
+  metric = c(
+    "Current credit", "Current annuity", "Reported income", "Goods price",
+    "Annuity-to-income proxy", "Credit-to-income proxy", "Financing-to-goods proxy"
+  ),
+  construction = c(
+    "AMT_CREDIT", "AMT_ANNUITY", "AMT_INCOME_TOTAL", "AMT_GOODS_PRICE",
+    "AMT_ANNUITY / AMT_INCOME_TOTAL", "AMT_CREDIT / AMT_INCOME_TOTAL",
+    "AMT_CREDIT / AMT_GOODS_PRICE"
+  ),
+  stringsAsFactors = FALSE
+)
+kable_clean(metric_definitions)
+```
+
+The output shows repayment-capacity proxies by contract type, their within-product relationship with `TARGET`, a plot of median requested credit, and the metric definitions used.
+
+Cash-loan applicants have higher median credit, annuity burden, credit-to-income, and financing-to-goods ratios than revolving-loan applicants. The within-product target results show why product matters. For cash loans, the financing-to-goods target rate rises from 7.2% in the lowest quintile to 11.6% in the highest, while annuity-to-income rises more modestly and credit-to-income is nonlinear. The revolving-loan patterns are flatter or move in the opposite direction. I shouldn't force one affordability effect across both products.
+
+**Decision:** I'll retain the three affordability ratios as candidate features and model them separately by contract type. I won't use the EDA quintiles as fixed production cutoffs. During validation, I'll compare continuous terms, product interactions, and flexible nonlinear forms such as splines or tree splits; any bins will be learned on training data and kept only if they improve out-of-sample discrimination and calibration without creating unstable edge groups.
+
+## 13. Do sample sizes across applicant segments meet the thresholds needed for statistical significance?
+
+```{r}
+#| label: q13-segment-sizes
+#| fig-width: 10
+#| fig-height: 7
+
+# Count applicants and TARGET outcomes within each proposed categorical segment.
+segment_fields <- c(
+  "NAME_CONTRACT_TYPE", "NAME_INCOME_TYPE", "NAME_EDUCATION_TYPE",
+  "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE", "OCCUPATION_TYPE"
+)
+segment_sizes <- do.call(rbind, lapply(segment_fields, function(field) {
+  run_sql(sprintf("
+    SELECT '%1$s' AS field, CAST(%2$s AS VARCHAR) AS segment,
+      COUNT(*) AS applicants,
+      SUM(TARGET) AS target_1,
+      AVG(TARGET) AS target_rate
+    FROM application_train
+    GROUP BY %2$s
+  ", field, qname(field)))
+}))
+segment_sizes <- segment_sizes[order(segment_sizes$applicants, segment_sizes$field), ]
+kable_clean(segment_sizes)
+
+# Plot income-type segment sizes to make small groups visible.
+income_sizes <- segment_sizes[segment_sizes$field == "NAME_INCOME_TYPE", ]
+income_sizes <- income_sizes[order(income_sizes$applicants), ]
+old_par <- par(mar = c(5, 11, 4, 2))
+barplot(
+  income_sizes$applicants,
+  names.arg = income_sizes$segment,
+  horiz = TRUE,
+  las = 1,
+  xlab = "Number of training applicants",
+  ylab = "Income type",
+  main = "Training sample size by income type",
+  col = "#5BC0DE",
+  cex.names = 0.85
+)
+par(old_par)
+
+# List the design inputs that must be approved before a power calculation is valid.
+power_inputs_required <- data.frame(
+  required_input = c(
+    "Comparison/estimand", "Minimum effect size", "Significance level",
+    "Desired power", "Multiple-testing policy"
+  ),
+  supplied = rep("No", 5),
+  stringsAsFactors = FALSE
+)
+kable_clean(power_inputs_required)
+
+# Identify fields that need legal, policy, or proxy-discrimination review before modeling.
+fairness_review <- data.frame(
+  field_or_group = c(
+    "CODE_GENDER", "DAYS_BIRTH", "NAME_FAMILY_STATUS / CNT_CHILDREN",
+    "OCCUPATION_TYPE / ORGANIZATION_TYPE", "NAME_EDUCATION_TYPE",
+    "REGION_* / REG_CITY_*", "NAME_HOUSING_TYPE"
+  ),
+  concern = c(
+    "Direct sex/gender attribute",
+    "Age may be legally restricted or require special treatment",
+    "Family status may proxy protected characteristics",
+    "Employment categories may encode socioeconomic and demographic disparities",
+    "Education may proxy socioeconomic status and opportunity",
+    "Location can proxy race, ethnicity, or neighborhood disadvantage",
+    "Housing status may proxy wealth and socioeconomic position"
+  ),
+  current_disposition = c(
+    "Do not name as a preferred predictor; retain for fairness auditing subject to policy",
+    "Use only after legal/policy review; always audit performance by age group",
+    "Require fairness review before use",
+    "Treat as exploratory only; test incremental value and subgroup impact",
+    "Require fairness review before use",
+    "Do not use until geographic proxy review is complete",
+    "Require fairness review before use"
+  ),
+  stringsAsFactors = FALSE
+)
+kable_clean(fairness_review)
+```
+
+The output shows applicant and outcome counts, income-type sample sizes, the inputs still needed for power calculations, and fields requiring fairness or proxy-discrimination review.
+
+Several of the larger segments separate in ways that are worth following up. Cash loans have an 8.3% target rate versus 5.5% for revolving loans, lower-secondary education is at 10.9%, and low-skill laborers are at 17.2%. The even higher rates for applicants on maternity leave or unemployed look dramatic, but those groups contain only 5 and 22 people. I wouldn't make a standalone claim from samples that small.
+
+I still can't call any segment “large enough for significance” from the counts alone. That judgment needs an approved effect size, significance level, power target, and plan for multiple comparisons. Those choices should come before the tests, not after seeing which results look interesting.
+
+Occupation, education, geography, age, gender, family status, and housing can also act as protected attributes or proxies for them. I can use these fields to audit subgroup performance, but I won't promote occupation—or any other sensitive proxy—as a preferred predictor until the legal, policy, incremental-value, and disparity reviews are complete.
+
+# Interpretation
+
+## Anything missed against the BPS, dictionary, standing checks, or underwriting credibility?
+
+```{r}
+#| label: final-review
+
+# Record remaining controls identified from the BPS, dictionary, standing checks, and underwriting review.
+final_review <- data.frame(
+  lens = c(
+    "BPS", "BPS", "BPS", "Dictionary", "Standing checks",
+    "Standing checks", "Underwriting credibility", "Underwriting credibility",
+    "Underwriting credibility", "Underwriting credibility"
+  ),
+  additional_item = c(
+    "Validate whether the strict no-history and bureau-depth definitions remain useful out of sample",
+    "The requested 10% approval-rate lift cannot be tested without current decisions, rejected applicants, and an approval policy",
+    "AUC-ROC >= 0.79 is a later model-validation criterion, not an EDA result",
+    "Document fields and codes absent from the 219-row dictionary before assigning business meaning",
+    "Keep TARGET unavailable in application_test and out of all predictor construction",
+    "Apply identical transformations to train and test after train-only fitting decisions",
+    "Do not call reported income verified income or bureau debt a complete monthly DTI",
+    "Do not label application timestamps/contact flags as a digital footprint",
+    "Do not treat no bureau history, zero debt, unmatched history, and missing collection as the same state",
+    "Do not use future realized payments, balances, updates, or terminations as application-time predictors"
+  ),
+  planned_action = c(
+    "Carry separate strict-no-history, bureau-depth, and unmatched-history indicators into validation",
+    "Label the business outcome unevaluable from the supplied development sample",
+    "Evaluate only after a model and validation design exist",
+    "Maintain an undocumented-field/code register",
+    "Enforce role metadata for TARGET",
+    "Use a single fitted preprocessing recipe",
+    "Use proxy labels and document denominator/coverage limitations",
+    "Use only the names and provenance supported by the source fields",
+    "Preserve distinct indicators through feature engineering",
+    "Enforce the decision-time inventory before aggregation"
+  ),
+  stringsAsFactors = FALSE
+)
+kable_clean(final_review)
+```
+
+The output lists the remaining scope, provenance, leakage, and underwriting-credibility controls not fully resolved by the preceding tables.
+
+# Conclusion
+
+## Results summary
+
+### What the EDA established
+
+The training data gives me 307,511 applicants, including 24,825 with observed payment difficulty. That works out to 8.07%, which is very close to the BPS's approximate 8% baseline. There are enough positive cases to build a model, but accuracy by itself would be misleading with this imbalance. I'll need stratified validation and a mix of ROC-AUC, precision-recall, calibration, and class-specific error measures.
+
+Overall, the relational structure is usable. The application, bureau, previous-application, and monthly account keys match their expected grains, and I found no exact duplicate rows. Installments looked like an exception at first, but the repeated rows turned out to be separate payment events rather than duplicate loads. I still need to aggregate those events carefully before moving to an applicant-level model.
+
+### Data problems discovered
+
+The biggest data problems aren't broken files. They're questions of meaning and timing:
+
+- `DAYS_EMPLOYED` and several previous-application date fields use the undocumented `365243` sentinel.
+- The dictionary contains stale or inconsistent identifiers, including `SK_BUREAU_ID` where the raw files use `SK_ID_BUREAU`, plus entries for fields absent from the raw schemas.
+- `XNA` is rare in some fields but structural in others, including more than one million `NAME_PRODUCT_TYPE` rows.
+- Historical tables contain substantial unmatched parent keys; using parent-only inner joins would discard records.
+- Seventeen bureau updates appear after the application, while month-zero bureau balances have ambiguous within-month timing.
+- `EXT_SOURCE_1` missingness differs by 14.3 percentage points between train and test.
+- Several amount fields are strongly right-skewed, and the maximum reported income is far beyond the central range.
+
+That changes how I want to clean the data. A blanket imputation, deduplication, outlier deletion, or placeholder rule would erase important differences. The treatment has to follow what each field represents and when it became known.
+
+### Relationships that warrant further analysis
+
+The clearest descriptive relationships now come from prior delinquency, bureau depth, and product-specific affordability. Prior bureau delinquency has a 15.8% target rate compared with 7.6% for bureau history without measured delinquency. Installment delinquency is 10.5% versus 8.0%. Among cash loans, the financing-to-goods rate moves from 7.2% in the lowest quintile to 11.6% in the highest. Applicants with no bureau record are at 10.1%, but the stricter no-history-anywhere group contains only 2,200 applicants and has a 7.1% rate.
+
+I don't read these patterns as causal. Product, income, underwriting policy, and data collection can still explain part of them. The credit-card delinquency result even moves in the opposite direction, which is a warning that source definitions and selection matter. My next step is to test whether the larger relationships hold up together and out of sample.
+
+### Candidate predictors supported by the EDA
+
+The strongest candidate predictors supported by this EDA are prior bureau delinquency, prior installment delinquency, bureau-record depth, missing credit-inquiry information, and cash-loan financing-to-goods. These signals connect more directly to repayment history or affordability than occupation does. Contract type still matters as context because several affordability relationships change direction or shape between cash and revolving loans.
+
+Still, these are leads—not proven predictors. I need to test them out of sample and account for related factors such as product, income, requested credit, and data availability. Occupation is no longer presented as a preferred predictor; it stays in the fairness audit until its incremental value, subgroup impact, and policy acceptability are reviewed.
+
+### Influence on the analytics approach
+
+This EDA changed how I plan to approach the model:
+
+1. I'll keep strict no-history, bureau-depth, unmatched-history, and missing-field indicators separate. The EDA shows they describe different populations.
+2. I'll build historical features through decision-time-safe applicant aggregation. Where it is valid, I'll use the direct `SK_ID_CURR` route and keep indicators showing source coverage.
+3. Sentinels and placeholders will be handled field by field, with a flag kept separate from the cleaned numeric value.
+4. Every preprocessing decision will be fit on training data and then applied unchanged to test data. That includes a clear rule for unseen categories and the shift in `EXT_SOURCE_1` availability.
+5. I'll test product interactions and robust transformations because cash and revolving loans—and their amount distributions—behave differently.
+
+One important limitation remains. This dataset can't establish the BPS's 10% approval-lift objective because it doesn't include rejected applicants, the current approval policy, or the operating threshold. For now, the realistic goal is a well-calibrated, decision-time-valid risk model with transparent coverage and subgroup checks. Policy lift has to wait until the decision and threshold information is available.
+
+### Use of AI
+
+I used AI throughout this project as a working partner. It helped me create my EDA plan and develop the EDA through R coding. I was able to spend more time thinking about the questions I wanted to answer and how the answers should be displayed in an organized notebook, as opposed to how the code should be written. AI helped me troubleshoot issues and improve some of the tables, plots, and writing. I reviewed and challenged everything it produced against the raw data, data dictionary, business problem statement, and earlier project documents.
+
+```{r}
+#| label: disconnect
+#| include: false
+
+dbDisconnect(con, shutdown = TRUE)
+```

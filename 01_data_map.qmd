@@ -532,6 +532,231 @@ knitr::kable(
 )
 ```
 
+### Repeated-Record and Composite-Key Checks
+
+The monthly history tables do not have a single-row identifier. Their expected composite keys are therefore tested for repeated table-period records.
+
+`installments_payments` is an event table rather than a monthly table. Multiple rows for the same scheduled installment may represent split or partial payments, so this multiplicity will be quantified and reviewed rather than automatically classified as a duplicate error.
+
+| Table | Record-level key or grouping | Interpretation |
+|---|---|---|
+| `bureau_balance` | `SK_ID_BUREAU + MONTHS_BALANCE` | More than one record for the same bureau account and month requires review |
+| `POS_CASH_balance` | `SK_ID_PREV + MONTHS_BALANCE` | More than one record for the same previous loan and month requires review |
+| `credit_card_balance` | `SK_ID_PREV + MONTHS_BALANCE` | More than one record for the same previous account and month requires review |
+| `installments_payments` | `SK_ID_PREV + NUM_INSTALMENT_VERSION + NUM_INSTALMENT_NUMBER` | Multiple rows may represent split payments and will not automatically be treated as errors |
+
+The following executed checks report repeated groups, excess rows, missing key components, and the maximum number of rows associated with one grouping.
+
+```{r}
+#| label: composite-key-checks
+#| cache: true
+
+check_repeated_group <- function(filename, keys, check_label) {
+  empty_result <- function(status) {
+    data.frame(
+      Table = tools::file_path_sans_ext(filename),
+      Check = check_label,
+      Grouping = paste(keys, collapse = " + "),
+      Rows = NA_real_,
+      `Missing key rows` = NA_real_,
+      `Repeated groups` = NA_real_,
+      `Excess rows` = NA_real_,
+      `Maximum group size` = NA_real_,
+      Status = status,
+      check.names = FALSE
+    )
+  }
+
+  if (!filename %in% names(csv_lookup)) {
+    return(empty_result("File not found"))
+  }
+
+  quoted_keys <- vapply(
+    keys,
+    function(key) {
+      as.character(DBI::dbQuoteIdentifier(con, key))
+    },
+    character(1)
+  )
+
+  group_columns <- paste(quoted_keys, collapse = ", ")
+
+  missing_condition <- paste(
+    sprintf(
+      "(%1$s IS NULL OR TRIM(%1$s) = '')",
+      quoted_keys
+    ),
+    collapse = " OR "
+  )
+
+  query <- sprintf(
+    paste0(
+      "WITH source AS (",
+      "  SELECT * FROM %1$s",
+      "), grouped AS (",
+      "  SELECT %2$s, COUNT(*) AS group_size ",
+      "  FROM source ",
+      "  GROUP BY %2$s",
+      ") ",
+      "SELECT ",
+      "  (SELECT COUNT(*) FROM source) AS n_rows, ",
+      "  (SELECT COUNT(*) FROM source ",
+      "   WHERE %3$s) AS missing_key_rows, ",
+      "  COALESCE(SUM(CASE WHEN group_size > 1 ",
+      "    THEN 1 ELSE 0 END), 0) AS repeated_groups, ",
+      "  COALESCE(SUM(CASE WHEN group_size > 1 ",
+      "    THEN group_size - 1 ELSE 0 END), 0) AS excess_rows, ",
+      "  COALESCE(MAX(group_size), 0) AS maximum_group_size ",
+      "FROM grouped"
+    ),
+    csv_reader(filename),
+    group_columns,
+    missing_condition
+  )
+
+  result <- DBI::dbGetQuery(con, query)
+
+  repeated_groups <- as.numeric(result$repeated_groups)
+  missing_key_rows <- as.numeric(result$missing_key_rows)
+
+  status <- if (
+    repeated_groups == 0 &&
+    missing_key_rows == 0
+  ) {
+    "Pass"
+  } else {
+    "Review"
+  }
+
+  data.frame(
+    Table = tools::file_path_sans_ext(filename),
+    Check = check_label,
+    Grouping = paste(keys, collapse = " + "),
+    Rows = as.numeric(result$n_rows),
+    `Missing key rows` = missing_key_rows,
+    `Repeated groups` = repeated_groups,
+    `Excess rows` = as.numeric(result$excess_rows),
+    `Maximum group size` =
+      as.numeric(result$maximum_group_size),
+    Status = status,
+    check.names = FALSE
+  )
+}
+
+check_exact_duplicates <- function(filename) {
+  if (!filename %in% names(csv_lookup)) {
+    return(
+      data.frame(
+        Table = tools::file_path_sans_ext(filename),
+        Check = "Exact duplicate rows",
+        Grouping = "All columns",
+        Rows = NA_real_,
+        `Missing key rows` = NA_real_,
+        `Repeated groups` = NA_real_,
+        `Excess rows` = NA_real_,
+        `Maximum group size` = NA_real_,
+        Status = "File not found",
+        check.names = FALSE
+      )
+    )
+  }
+
+  query <- sprintf(
+    paste0(
+      "WITH source AS (",
+      "  SELECT * FROM %1$s",
+      "), grouped AS (",
+      "  SELECT *, COUNT(*) AS group_size ",
+      "  FROM source ",
+      "  GROUP BY ALL",
+      ") ",
+      "SELECT ",
+      "  (SELECT COUNT(*) FROM source) AS n_rows, ",
+      "  COALESCE(SUM(CASE WHEN group_size > 1 ",
+      "    THEN 1 ELSE 0 END), 0) AS repeated_groups, ",
+      "  COALESCE(SUM(CASE WHEN group_size > 1 ",
+      "    THEN group_size - 1 ELSE 0 END), 0) AS excess_rows, ",
+      "  COALESCE(MAX(group_size), 0) AS maximum_group_size ",
+      "FROM grouped"
+    ),
+    csv_reader(filename)
+  )
+
+  result <- DBI::dbGetQuery(con, query)
+  repeated_groups <- as.numeric(result$repeated_groups)
+
+  data.frame(
+    Table = tools::file_path_sans_ext(filename),
+    Check = "Exact duplicate rows",
+    Grouping = "All columns",
+    Rows = as.numeric(result$n_rows),
+    `Missing key rows` = NA_real_,
+    `Repeated groups` = repeated_groups,
+    `Excess rows` = as.numeric(result$excess_rows),
+    `Maximum group size` =
+      as.numeric(result$maximum_group_size),
+    Status = if (repeated_groups == 0) "Pass" else "Review",
+    check.names = FALSE
+  )
+}
+
+composite_key_results <- rbind(
+  check_repeated_group(
+    "bureau_balance.csv",
+    c("SK_ID_BUREAU", "MONTHS_BALANCE"),
+    "Monthly composite key"
+  ),
+  check_repeated_group(
+    "POS_CASH_balance.csv",
+    c("SK_ID_PREV", "MONTHS_BALANCE"),
+    "Monthly composite key"
+  ),
+  check_repeated_group(
+    "credit_card_balance.csv",
+    c("SK_ID_PREV", "MONTHS_BALANCE"),
+    "Monthly composite key"
+  ),
+  check_exact_duplicates(
+    "installments_payments.csv"
+  ),
+  check_repeated_group(
+    "installments_payments.csv",
+    c(
+      "SK_ID_PREV",
+      "NUM_INSTALMENT_VERSION",
+      "NUM_INSTALMENT_NUMBER"
+    ),
+    "Scheduled-installment multiplicity"
+  )
+)
+
+composite_key_display <- composite_key_results
+
+count_columns <- c(
+  "Rows",
+  "Missing key rows",
+  "Repeated groups",
+  "Excess rows",
+  "Maximum group size"
+)
+
+composite_key_display[count_columns] <- lapply(
+  composite_key_display[count_columns],
+  format_count
+)
+
+knitr::kable(
+  composite_key_display,
+  align = c("l", "l", "l", "r", "r", "r", "r", "r", "c")
+)
+```
+
+For the monthly tables, `Pass` means that the proposed composite key is complete and unique. `Review` identifies missing key components or repeated table-period records requiring investigation.
+
+For `installments_payments`, repeated scheduled-installment groups are not automatically errors. They may represent partial payments, split payments, or multiple recorded transactions. Exact duplicate rows and scheduled-installment multiplicity are therefore reported separately.
+
+These checks are observational. No repeated records will be consolidated or removed until their meaning has been examined.
+
 ### Train and Test Separation
 
 ```{r}
