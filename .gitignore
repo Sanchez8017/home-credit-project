@@ -35,3 +35,12 @@ data/processed/*
 Thumbs.db
 /.quarto/
 **/*.quarto_ipynb
+
+# Model objects and other data formats
+*.rds
+*.rda
+*.parquet
+*.feather
+*.zip
+*.gz
+models/
