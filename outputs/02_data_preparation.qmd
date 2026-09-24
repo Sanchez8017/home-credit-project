@@ -1,0 +1,1340 @@
+---
+title: "Home Credit Data Preparation"
+author: "Alejo Sanchez"
+date: "23 September 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show preparation code"
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+## Purpose
+
+This notebook is the data-preparation phase of the CRISP-DM process. It turns the eight raw Home Credit tables into one modeling-ready row per applicant for both the training and the scoring (test) populations. Every transformation traces back to a decision recorded in my [exploratory data analysis](01_eda.qmd), or it is explicitly identified as standard practice.
+
+## How the notebook is organized
+
+The preparation is split into two kinds of work, and the split matters for train/test consistency:
+
+1. **Row-level functions that learn nothing.** Cleaning, feature construction, supplementary-table aggregation, and joins apply a fixed rule to each row or applicant. Running them on train and test separately cannot leak information because nothing is estimated from the data.
+2. **One preprocessing recipe that learns from training data only.** Anything estimated from the data—percentile caps, bin cutoffs, imputation medians, and the allowed category levels—is learned once with `prep()` on the training table, stored inside the recipe, and reused unchanged with `bake()` on the test table.
+
+Comments in the code use three labels so every choice can be traced:
+
+- `# EDA Qn: ...` — the transformation implements the decision recorded under that EDA question.
+- `# Informed by EDA Qn; ... selected during preparation` — the EDA motivated the idea, but the specific aggregation, statistic, or role was my choice during preparation.
+- `# Not from EDA: standard practice` — an implementation choice I made during preparation; it is not an EDA decision.
+
+# Setup
+
+```{r}
+#| label: setup
+
+library(DBI)
+library(duckdb)
+library(knitr)
+library(dplyr)
+library(recipes)
+
+table_names <- c(
+  "application_train", "application_test", "bureau", "bureau_balance",
+  "previous_application", "POS_CASH_balance", "credit_card_balance",
+  "installments_payments", "sample_submission"
+)
+
+#' Locate the raw-data folder and confirm every required CSV is present
+#'
+#' Purpose: Apply the EDA's project-root logic (project root or outputs/), but stop with
+#'   an informative message instead of failing later inside normalizePath() or DuckDB.
+#' Inputs:  tables - required table names; candidates - folders that may be the project root.
+#' Outputs: A list with project_root and raw_dir (normalized path).
+#' Learns from data: No.
+locate_raw_data <- function(tables, candidates = c(".", "..")) {
+  # Not from EDA: standard practice. Fail early and say exactly what is missing.
+  found <- candidates[dir.exists(file.path(candidates, "data", "raw"))]
+  if (!length(found)) {
+    stop(sprintf(
+      "Could not find data/raw from the working directory '%s'. Render the notebook from the project root or from outputs/.",
+      normalizePath(".", winslash = "/")
+    ))
+  }
+  raw_dir <- normalizePath(file.path(found[1], "data", "raw"), winslash = "/")
+  missing_csv <- tables[!file.exists(file.path(raw_dir, paste0(tables, ".csv")))]
+  if (length(missing_csv)) {
+    stop(sprintf("Missing required CSV file(s) in %s: %s",
+                 raw_dir, paste0(missing_csv, ".csv", collapse = ", ")))
+  }
+  list(project_root = found[1], raw_dir = raw_dir)
+}
+
+paths <- locate_raw_data(table_names)
+project_root <- paths$project_root
+raw_dir <- paths$raw_dir
+processed_dir <- file.path(project_root, "data", "processed")
+
+# In-memory DuckDB with one view per raw CSV. The large history tables are
+# aggregated inside DuckDB and never loaded into R at the row level.
+con <- dbConnect(duckdb(), dbdir = ":memory:")
+
+for (table_name in table_names) {
+  csv_path <- gsub("'", "''", file.path(raw_dir, paste0(table_name, ".csv")), fixed = TRUE)
+  dbExecute(
+    con,
+    sprintf(
+      # Not from EDA: standard practice. Same views as the EDA, except BOOLEAN is removed from
+      # the type candidates. Otherwise DuckDB reads EMERGENCYSTATE_MODE ("Yes"/"No") as
+      # BOOLEAN, which R returns as logical. recipes treats logical columns as neither
+      # numeric nor nominal, so imputation, step_unknown, and step_dummy would all skip it and
+      # its ~47% NAs would reach the model. As VARCHAR it keeps its recorded labels (EDA Q6).
+      # On the real files this changes that one column only; every other type is unchanged.
+      "CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s', header = true,
+         auto_type_candidates = ['BIGINT', 'DOUBLE', 'VARCHAR'])",
+      dbQuoteIdentifier(con, table_name), csv_path
+    )
+  )
+}
+
+#' Run a SQL query against the notebook's DuckDB connection
+#'
+#' Purpose: Shorthand for ad hoc queries, as in the EDA.
+#' Inputs:  sql - a SQL string.
+#' Outputs: The query result as a data frame.
+#' Learns from data: No.
+run_sql <- function(sql) dbGetQuery(con, sql)
+
+#' Format numbers as whole-number counts with thousands separators
+#'
+#' Purpose: Readable counts in displayed tables.
+#' Inputs:  x - numeric vector.
+#' Outputs: Character vector such as "307,511".
+#' Learns from data: No.
+fmt_int <- function(x) format(round(as.numeric(x)), big.mark = ",", scientific = FALSE)
+
+#' Display a data frame as a captioned table
+#'
+#' Purpose: Consistent table formatting across the notebook.
+#' Inputs:  x - data frame; caption - table caption; digits - decimal places.
+#' Outputs: A knitr table.
+#' Learns from data: No.
+kable_clean <- function(x, caption = NULL, digits = 3) {
+  knitr::kable(x, caption = caption, digits = digits, row.names = FALSE)
+}
+
+#' Divide safely, returning NA when the denominator is 0 or missing
+#'
+#' Purpose: One zero-denominator rule shared by every ratio feature.
+#' Inputs:  numerator, denominator - numeric vectors of equal length.
+#' Outputs: numerator / denominator, or NA where the denominator is 0 or NA.
+#' Learns from data: No.
+# EDA Q12: the ratios were built with NULLIF(denominator, 0), so a zero denominator is NA, not Inf.
+safe_divide <- function(numerator, denominator) {
+  ifelse(is.na(denominator) | denominator == 0, NA_real_, numerator / denominator)
+}
+```
+
+The setup mirrors the EDA: the raw CSVs are exposed as DuckDB views, so every source is read the same way the EDA read it. Before any view is created, `locate_raw_data()` confirms that `data/raw` exists and that all nine CSVs are present, and it names any missing file. `safe_divide()` is defined once because several functions below use the same zero-denominator rule.
+
+# Application cleaning
+
+`clean_application()` handles sentinels, placeholders, and unit conversions at the row level. It estimates nothing, so the same call on train and test gives consistent results without any stored parameters.
+
+```{r}
+#| label: clean-application
+
+#' Clean one application table (train or test)
+#'
+#' Purpose: Apply the EDA's row-level cleaning decisions to application data:
+#'   sentinel recoding, conversion from relative days to positive years,
+#'   placeholder handling, plausibility flags, and missing-inquiry indicators.
+#' Inputs:  df - application_train or application_test as a data frame.
+#' Outputs: The same rows in the same order, with cleaned and added columns.
+#'          The raw DAYS_* duration columns are replaced by their *_years versions,
+#'          except DAYS_BIRTH, which stays as an audit field.
+#' Learns from data: No. Every rule is a fixed constant, so train and test are
+#'   treated identically without stored parameters.
+clean_application <- function(df) {
+  df |>
+    mutate(
+      # Not from EDA: standard practice. read_csv_auto can type the same field as
+      # INTEGER in one file and BIGINT/DOUBLE in the other. Casting all integers to
+      # double gives train and test identical column types.
+      across(where(is.integer), as.double),
+
+      # EDA Q8, Q11: 365243 is an undocumented sentinel, not a duration. Keep a flag
+      # showing where it occurred before recoding the value to NA.
+      DAYS_EMPLOYED_SENTINEL = as.integer(!is.na(DAYS_EMPLOYED) & DAYS_EMPLOYED == 365243),
+      # EDA Q8, Q11: replace the 365243 sentinel with NA so it does not distort numeric use.
+      DAYS_EMPLOYED = if_else(DAYS_EMPLOYED == 365243, NA_real_, DAYS_EMPLOYED),
+
+      # EDA Q11: convert negative "days before application" to positive years.
+      age_years = -DAYS_BIRTH / 365.25,
+      # EDA Q11: employment duration in years, computed after the sentinel is removed.
+      employment_years = -DAYS_EMPLOYED / 365.25,
+      # The other application DAYS_* fields, converted the same way.
+      registration_years = -DAYS_REGISTRATION / 365.25,
+      id_publish_years = -DAYS_ID_PUBLISH / 365.25,
+      phone_change_years = -DAYS_LAST_PHONE_CHANGE / 365.25,
+
+      # EDA Q6: CODE_GENDER 'XNA' is a non-structural placeholder. Keep an indicator,
+      # then map it to a field-specific unknown level (both are audit fields, see the recipe).
+      CODE_GENDER_XNA = as.integer(CODE_GENDER %in% "XNA"),
+      CODE_GENDER = if_else(CODE_GENDER %in% "XNA", "gender_unknown", CODE_GENDER),
+
+      # EDA Q6: ORGANIZATION_TYPE 'XNA' is a non-structural placeholder. Keep an indicator,
+      # then map it to a field-specific unknown level.
+      ORGANIZATION_TYPE_XNA = as.integer(ORGANIZATION_TYPE %in% "XNA"),
+      ORGANIZATION_TYPE = if_else(
+        ORGANIZATION_TYPE %in% "XNA", "organization_unknown", ORGANIZATION_TYPE
+      ),
+
+      # EDA Q11: a car older than 50 years fails the plausibility check. Flag it for
+      # sensitivity testing; keep the value unchanged and delete nothing.
+      OWN_CAR_AGE_GT50 = as.integer(!is.na(OWN_CAR_AGE) & OWN_CAR_AGE > 50),
+
+      # EDA Q7: missing inquiry data (10.3% target rate) differs from zero inquiries (7.7%).
+      # One indicator covers all six fields because they go missing together.
+      # Genuine zeros stay 0 and the NAs are NOT filled with 0 here.
+      AMT_REQ_CREDIT_BUREAU_MISSING = as.integer(
+        if_any(starts_with("AMT_REQ_CREDIT_BUREAU_"), is.na)
+      )
+    ) |>
+    # Not from EDA: standard practice. Drop the raw day counts that now duplicate a *_years
+    # column exactly (raw DAYS_EMPLOYED would also carry the sentinel back in).
+    # DAYS_BIRTH is kept because the recipe assigns it the audit role (EDA Q13).
+    select(-DAYS_EMPLOYED, -DAYS_REGISTRATION, -DAYS_ID_PUBLISH, -DAYS_LAST_PHONE_CHANGE)
+  # EDA Q1: SK_ID_CURR is kept only as a join key; the recipe gives it the "id" role.
+}
+```
+
+Two cleaning choices are worth stating plainly. First, the inquiry indicator records *that* the bureau-inquiry fields were missing, while their `NA` values are left for the training-median imputation in the recipe. That keeps "missing" and "zero inquiries" as separate states, as Q7 requires. Second, `OWN_CAR_AGE` values above 50 are flagged but not altered, so validation can test whether they matter instead of the preparation step deciding for the model.
+
+# Feature engineering
+
+`engineer_application_features()` adds the three repayment-capacity proxies from Q12. The names match the industry-context document so the same metric has one name across the project.
+
+```{r}
+#| label: engineer-features
+
+#' Engineer application-level affordability features
+#'
+#' Purpose: Add the three repayment-capacity proxies approved in EDA Q12.
+#' Inputs:  df - output of clean_application().
+#' Outputs: df with annuity_to_income, credit_to_income, and financing_to_goods.
+#' Learns from data: No. Each value comes from the applicant's own row.
+engineer_application_features <- function(df) {
+  df |>
+    mutate(
+      # EDA Q12: annuity burden relative to reported income; NA when income is 0.
+      annuity_to_income = safe_divide(AMT_ANNUITY, AMT_INCOME_TOTAL),
+      # EDA Q12: requested credit relative to reported income; NA when income is 0.
+      credit_to_income = safe_divide(AMT_CREDIT, AMT_INCOME_TOTAL),
+      # EDA Q12: credit relative to goods price; NA when the goods price is 0 or missing.
+      financing_to_goods = safe_divide(AMT_CREDIT, AMT_GOODS_PRICE)
+    )
+  # Deliberately NOT added: EXT_SOURCE summaries, a document-flag count, or an
+  # employment-to-age ratio. The EDA does not support any of them.
+}
+```
+
+These ratios are proxies. They use reported (not verified) income, and they are not a conventional debt-to-income ratio. Following the EDA's final review, I keep that caveat attached to their names and definitions.
+
+# Supplementary aggregations
+
+Each history table is filtered to decision-time-safe records (Q9) and summarized to one row per `SK_ID_CURR` inside DuckDB. The functions take the connection rather than a data frame because installments and POS are too large to aggregate comfortably in R memory.
+
+These aggregations run once over the full supplementary tables. They summarize each applicant's own history with fixed rules, so they learn nothing that could leak between train and test. The same aggregate table is joined to both populations.
+
+```{r}
+#| label: aggregate-helper
+
+#' Run an aggregation query and check its grain
+#'
+#' Purpose: Execute a DuckDB aggregation, confirm one row per SK_ID_CURR, and
+#'   cast integer columns to double so column types match across populations.
+#' Inputs:  con - DuckDB connection; sql - aggregation query; label - name for errors.
+#' Outputs: A data frame with one row per SK_ID_CURR.
+#' Learns from data: No.
+fetch_aggregate <- function(con, sql, label) {
+  out <- dbGetQuery(con, sql)
+  # EDA Q2: every applicant-level aggregate must respect the applicant grain.
+  if (anyDuplicated(out$SK_ID_CURR)) {
+    stop(sprintf("%s aggregate must have one row per SK_ID_CURR", label))
+  }
+  # Not from EDA: standard practice. Consistent numeric types across all sources.
+  out[] <- lapply(out, function(x) if (is.integer(x)) as.double(x) else x)
+  out
+}
+```
+
+## Bureau and bureau balance
+
+```{r}
+#| label: aggregate-bureau
+
+#' Aggregate external bureau history to the applicant
+#'
+#' Purpose: Summarize decision-time-safe bureau records and pre-application
+#'   bureau-balance months to one row per SK_ID_CURR.
+#' Inputs:  con - DuckDB connection with bureau and bureau_balance views.
+#' Outputs: SK_ID_CURR, bureau_record_count, bureau_total_debt, bureau_delinquent (0/1),
+#'          bureau_balance_month_rows. Applicants with no eligible records are absent;
+#'          join_supplementary() turns that absence into explicit coverage states.
+#' Learns from data: No.
+aggregate_bureau <- function(con) {
+  fetch_aggregate(con, "
+    WITH bureau_dt AS (
+      -- EDA Q9: keep only records originated AND last updated at or before time zero.
+      -- This removes the 17 post-application updates.
+      SELECT *
+      FROM bureau
+      WHERE DAYS_CREDIT <= 0 AND DAYS_CREDIT_UPDATE <= 0
+    ),
+    bb AS (
+      -- EDA Q9: month 0 has ambiguous within-month timing, so only months before it are used.
+      -- EDA Q4: link through SK_ID_BUREAU -> bureau -> SK_ID_CURR. The inner join to the
+      -- filtered bureau drops orphan bureau_balance rows (no applicant key) and months
+      -- belonging to excluded post-application records.
+      SELECT b.SK_ID_CURR,
+        -- Not from EDA: standard practice. Count of pre-application monthly status rows,
+        -- a measure of how much bureau payment history is observable.
+        CAST(COUNT(*) AS DOUBLE) AS bureau_balance_month_rows
+      FROM bureau_balance bb
+      JOIN bureau_dt b ON bb.SK_ID_BUREAU = b.SK_ID_BUREAU
+      WHERE bb.MONTHS_BALANCE < 0
+      GROUP BY b.SK_ID_CURR
+    ),
+    agg AS (
+      SELECT SK_ID_CURR,
+        -- EDA Q7: record count, later banded as 0 / 1 / 2-4 / 5+.
+        CAST(COUNT(*) AS DOUBLE) AS bureau_record_count,
+        -- EDA final review: total outstanding bureau debt, a debt STOCK.
+        -- NULL when every record's debt is NULL, which keeps 'missing' separate from 0.
+        CAST(SUM(AMT_CREDIT_SUM_DEBT) AS DOUBLE) AS bureau_total_debt,
+        -- EDA Q7 delinquency definition: 30+ days overdue OR any overdue amount.
+        CAST(MAX(CASE WHEN CREDIT_DAY_OVERDUE >= 30
+                        OR COALESCE(AMT_CREDIT_SUM_OVERDUE, 0) > 0
+                      THEN 1 ELSE 0 END) AS DOUBLE) AS bureau_delinquent
+      FROM bureau_dt
+      GROUP BY SK_ID_CURR
+    )
+    SELECT agg.*, COALESCE(bb.bureau_balance_month_rows, 0) AS bureau_balance_month_rows
+    FROM agg
+    LEFT JOIN bb USING (SK_ID_CURR)
+  ", "bureau")
+}
+```
+
+In the EDA, the Q7 bureau delinquency rates were computed without the Q9 date filter. Here the filter comes first, so the modeled flag uses only information known at decision time. Negative `AMT_CREDIT_SUM_DEBT` values are passed through unchanged because the EDA did not audit them.
+
+## Previous applications
+
+```{r}
+#| label: aggregate-previous
+
+#' Aggregate previous Home Credit applications to the applicant
+#'
+#' Purpose: Apply the Q8 sentinel rules and Q9 timing rules to previous_application
+#'   (as the view previous_clean), then count previous applications by status and by
+#'   sentinel occurrence.
+#' Inputs:  con - DuckDB connection with a previous_application view.
+#' Outputs: SK_ID_CURR, prev_approved_count, prev_refused_count, prev_canceled_count,
+#'          prev_unused_count, and five prev_*_sentinel_count columns.
+#'          Side effect: creates or replaces the DuckDB view previous_clean.
+#' Learns from data: No.
+aggregate_previous <- function(con) {
+  dbExecute(con, "
+    CREATE OR REPLACE VIEW previous_clean AS
+    SELECT
+      SK_ID_PREV, SK_ID_CURR, NAME_CONTRACT_STATUS, DAYS_DECISION,
+      -- EDA Q6: XAP is kept as the structural 'not applicable' reject reason.
+      CODE_REJECT_REASON,
+      -- EDA Q6, Q8: XNA stays a structural category in these fields; nothing is recoded.
+      NAME_PRODUCT_TYPE, NAME_YIELD_GROUP, NAME_PORTFOLIO,
+      NAME_GOODS_CATEGORY, NAME_SELLER_INDUSTRY,
+
+      -- EDA Q8: field-specific sentinel flags, kept before 365243 is recoded to NULL.
+      CAST(COALESCE(DAYS_FIRST_DRAWING = 365243, FALSE) AS INTEGER) AS DAYS_FIRST_DRAWING_SENTINEL,
+      CAST(COALESCE(DAYS_FIRST_DUE = 365243, FALSE) AS INTEGER) AS DAYS_FIRST_DUE_SENTINEL,
+      CAST(COALESCE(DAYS_LAST_DUE_1ST_VERSION = 365243, FALSE) AS INTEGER) AS DAYS_LAST_DUE_1ST_VERSION_SENTINEL,
+      CAST(COALESCE(DAYS_LAST_DUE = 365243, FALSE) AS INTEGER) AS DAYS_LAST_DUE_SENTINEL,
+      CAST(COALESCE(DAYS_TERMINATION = 365243, FALSE) AS INTEGER) AS DAYS_TERMINATION_SENTINEL,
+
+      -- EDA Q8: replace 365243 with NULL for numeric use.
+      NULLIF(DAYS_FIRST_DRAWING, 365243) AS DAYS_FIRST_DRAWING,
+      NULLIF(DAYS_FIRST_DUE, 365243) AS DAYS_FIRST_DUE,
+      -- EDA Q9: a future DAYS_LAST_DUE_1ST_VERSION is kept, but only as scheduled intent.
+      NULLIF(DAYS_LAST_DUE_1ST_VERSION, 365243) AS DAYS_LAST_DUE_1ST_VERSION,
+      -- EDA Q9: realized dates count only if observed by time zero (<= 0); later ones become NULL.
+      CASE WHEN NULLIF(DAYS_LAST_DUE, 365243) <= 0 THEN DAYS_LAST_DUE END AS DAYS_LAST_DUE,
+      CASE WHEN NULLIF(DAYS_TERMINATION, 365243) <= 0 THEN DAYS_TERMINATION END AS DAYS_TERMINATION
+    FROM previous_application
+    -- EDA Q9: the previous decision must have happened at or before time zero.
+    WHERE DAYS_DECISION <= 0
+  ")
+
+  fetch_aggregate(con, "
+    SELECT SK_ID_CURR,
+      -- Informed by EDA Q6 (contract-status context) and Q9 (decision-time filter);
+      -- counts by previous-application status selected during preparation.
+      CAST(SUM(CASE WHEN NAME_CONTRACT_STATUS = 'Approved' THEN 1 ELSE 0 END) AS DOUBLE) AS prev_approved_count,
+      CAST(SUM(CASE WHEN NAME_CONTRACT_STATUS = 'Refused' THEN 1 ELSE 0 END) AS DOUBLE) AS prev_refused_count,
+      CAST(SUM(CASE WHEN NAME_CONTRACT_STATUS = 'Canceled' THEN 1 ELSE 0 END) AS DOUBLE) AS prev_canceled_count,
+      CAST(SUM(CASE WHEN NAME_CONTRACT_STATUS = 'Unused offer' THEN 1 ELSE 0 END) AS DOUBLE) AS prev_unused_count,
+      -- EDA Q8: applicant-level counts of each field-specific sentinel.
+      CAST(SUM(DAYS_FIRST_DRAWING_SENTINEL) AS DOUBLE) AS prev_first_drawing_sentinel_count,
+      CAST(SUM(DAYS_FIRST_DUE_SENTINEL) AS DOUBLE) AS prev_first_due_sentinel_count,
+      CAST(SUM(DAYS_LAST_DUE_1ST_VERSION_SENTINEL) AS DOUBLE) AS prev_last_due_1st_version_sentinel_count,
+      CAST(SUM(DAYS_LAST_DUE_SENTINEL) AS DOUBLE) AS prev_last_due_sentinel_count,
+      CAST(SUM(DAYS_TERMINATION_SENTINEL) AS DOUBLE) AS prev_termination_sentinel_count
+    FROM previous_clean
+    GROUP BY SK_ID_CURR
+  ", "previous_application")
+}
+```
+
+The timing and placeholder rules are applied in `previous_clean` even though no date or categorical feature is built from previous applications yet. That was deliberate: the EDA supports the rules, but it does not support any specific date feature. If later modeling needs one, it can be built from `previous_clean` without re-deriving the rules.
+
+## Installments
+
+```{r}
+#| label: aggregate-installments
+
+#' Aggregate installment history to the applicant, as two decision-time populations
+#'
+#' Purpose: Summarize (1) payment events observed by time zero and (2) scheduled
+#'   installments due by time zero, measured against payments observed by time zero.
+#' Inputs:  con - DuckDB connection with an installments_payments view.
+#' Outputs: One row per SK_ID_CURR with at least one payment observed by time zero OR one
+#'          installment due by time zero. Event features are NULL for applicants with only
+#'          due schedules, and schedule features are NULL for applicants with only
+#'          prepayments; join_supplementary() handles both.
+#' Learns from data: No.
+aggregate_installments <- function(con) {
+  fetch_aggregate(con, "
+    WITH payments AS (
+      -- Population 1: payment events.
+      -- EDA Q9: realized payment information counts only if it was observed by time zero.
+      -- This includes a payment made before time zero for an installment due afterward
+      -- (a prepayment); that payment was known at decision time.
+      -- A NULL payment date is not an observed event, so it is not in this population.
+      -- EDA Q3: NO deduplication. Repeated schedule rows are separate payment events.
+      SELECT *
+      FROM installments_payments
+      WHERE DAYS_ENTRY_PAYMENT <= 0
+    ),
+    due AS (
+      -- Population 2: scheduled obligations.
+      -- EDA Q9: only installments due by time zero are obligations the applicant had to
+      -- meet before the decision; later due dates are 'future schedule, not realized behavior'.
+      -- Rows with a NULL payment date are kept here. Not from EDA: they are treated as
+      -- 'no payment observed', so the installment counts as unpaid (the EDA never
+      -- established what these rows mean beyond that).
+      SELECT *
+      FROM installments_payments
+      WHERE DAYS_INSTALMENT <= 0
+    ),
+    events AS (
+      -- Event level: one row per observed payment.
+      SELECT SK_ID_CURR,
+        -- EDA Q3: total paid, number of payment events, and most recent payment.
+        CAST(SUM(AMT_PAYMENT) AS DOUBLE) AS inst_total_paid,
+        CAST(COUNT(*) AS DOUBLE) AS inst_payment_events,
+        CAST(MAX(DAYS_ENTRY_PAYMENT) AS DOUBLE) AS inst_latest_payment_days,
+        -- Informed by EDA Q3 (timing gap); mean and max selected during preparation.
+        -- Positive = paid after the due date; negative = paid early.
+        CAST(AVG(DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT) AS DOUBLE) AS inst_days_late_mean,
+        CAST(MAX(DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT) AS DOUBLE) AS inst_days_late_max,
+        -- EDA Q7: a payment made 30+ days after its due date is delinquent. Measured on
+        -- observed payments only, so unpaid installments are not counted as delinquent.
+        CAST(SUM(CASE WHEN DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT >= 30 THEN 1 ELSE 0 END) AS DOUBLE)
+          AS inst_late30_events,
+        CAST(MAX(CASE WHEN DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT >= 30 THEN 1 ELSE 0 END) AS DOUBLE)
+          AS inst_delinquent
+      FROM payments
+      GROUP BY SK_ID_CURR
+    ),
+    schedule AS (
+      -- EDA Q3: amount gaps are measured per scheduled installment, summing every payment
+      -- made against it (split payments are legitimate). Only payments observed by time
+      -- zero count toward 'paid', so an installment paid after time zero is still
+      -- unpaid at decision time.
+      SELECT SK_ID_CURR, SK_ID_PREV, NUM_INSTALMENT_VERSION, NUM_INSTALMENT_NUMBER,
+        MAX(AMT_INSTALMENT) AS scheduled_amount,
+        COALESCE(SUM(CASE WHEN DAYS_ENTRY_PAYMENT <= 0 THEN AMT_PAYMENT END), 0) AS paid_by_time_zero,
+        -- EDA Q3: a schedule conflict = differing scheduled amount or due date within one group.
+        (COUNT(DISTINCT AMT_INSTALMENT) > 1 OR COUNT(DISTINCT DAYS_INSTALMENT) > 1) AS schedule_conflict
+      FROM due
+      GROUP BY SK_ID_CURR, SK_ID_PREV, NUM_INSTALMENT_VERSION, NUM_INSTALMENT_NUMBER
+    ),
+    schedule_agg AS (
+      SELECT SK_ID_CURR,
+        -- Not from EDA: standard practice. Number of installments that came due by time zero.
+        CAST(COUNT(*) AS DOUBLE) AS inst_due_schedules,
+        -- Informed by EDA Q3 (amount gap); total shortfall and underpaid count selected
+        -- during preparation. The 0.01 tolerance ignores floating-point rounding.
+        CAST(SUM(GREATEST(scheduled_amount - paid_by_time_zero, 0)) AS DOUBLE) AS inst_shortfall_total,
+        CAST(SUM(CASE WHEN paid_by_time_zero < scheduled_amount - 0.01 THEN 1 ELSE 0 END) AS DOUBLE)
+          AS inst_underpaid_schedules,
+        -- EDA Q3: keep the conflict flag even though the EDA found none.
+        CAST(MAX(CASE WHEN schedule_conflict THEN 1 ELSE 0 END) AS DOUBLE) AS inst_schedule_conflict
+      FROM schedule
+      GROUP BY SK_ID_CURR
+    )
+    -- FULL join: an applicant can appear in only one population (for example, only a
+    -- prepayment, or only unpaid due installments).
+    SELECT COALESCE(e.SK_ID_CURR, s.SK_ID_CURR) AS SK_ID_CURR,
+      e.* EXCLUDE (SK_ID_CURR),
+      s.* EXCLUDE (SK_ID_CURR)
+    FROM events e
+    FULL OUTER JOIN schedule_agg s ON e.SK_ID_CURR = s.SK_ID_CURR
+  ", "installments_payments")
+}
+```
+
+The function separates two questions that the EDA's single filter had mixed together. **What did the applicant actually pay before the decision?** That is the payment-event population, filtered only on the payment date. Payment timing, totals, and the Q7 delinquency flag come from it. **What did the applicant owe before the decision, and was it covered?** That is the schedule population, filtered only on the due date. Payments observed by time zero are summed against each installment, so an installment that was due but not yet paid (a `NULL` payment date, or a payment after the application) now shows up as a shortfall instead of disappearing.
+
+Two consequences are worth noting. Delinquency is still measured only on observed payments, so an unpaid due installment raises the shortfall but does not by itself make the applicant "delinquent". An applicant with due installments but *no* observed payment gets the separate state `history_delinquency_unmeasured`. The code cannot show that such an applicant had no delinquency, only that delinquency could not be measured. And because the populations differ from the EDA's Q7 query (which required both dates to be ≤ 0), installment counts and delinquency rates will not match the EDA tables exactly.
+
+Because the EDA found no schedule conflicts, `inst_schedule_conflict` will likely be constant on the real data. The recipe gives it a non-predictor `quality_check` role, so it stays visible in the output instead of being removed by the zero-variance filter.
+
+## POS/cash balance and credit-card coverage
+
+```{r}
+#| label: aggregate-pos-card
+
+#' Aggregate POS/cash monthly balances to the applicant
+#'
+#' Purpose: Flag prior POS/cash delinquency using pre-application months only.
+#' Inputs:  con - DuckDB connection with a POS_CASH_balance view.
+#' Outputs: SK_ID_CURR, pos_delinquent (0/1).
+#' Learns from data: No.
+aggregate_pos <- function(con) {
+  fetch_aggregate(con, "
+    SELECT SK_ID_CURR,
+      -- EDA Q7: POS delinquency = SK_DPD or SK_DPD_DEF of 30+ days.
+      CAST(MAX(CASE WHEN SK_DPD >= 30 OR SK_DPD_DEF >= 30 THEN 1 ELSE 0 END) AS DOUBLE)
+        AS pos_delinquent
+    FROM POS_CASH_balance
+    -- EDA Q9: months before time zero only; month 0 is ambiguous.
+    WHERE MONTHS_BALANCE < 0
+    -- EDA Q4: the direct SK_ID_CURR route recovers POS rows whose SK_ID_PREV is orphaned.
+    GROUP BY SK_ID_CURR
+  ", "POS_CASH_balance")
+}
+
+#' Record credit-card history coverage
+#'
+#' Purpose: Presence of pre-application credit-card history, and nothing else.
+#' Inputs:  con - DuckDB connection with a credit_card_balance view.
+#' Outputs: SK_ID_CURR, has_credit_card (1 for every returned applicant).
+#' Learns from data: No.
+aggregate_credit_card <- function(con) {
+  fetch_aggregate(con, "
+    -- EDA Q7: presence only. The credit-card delinquency flag is NOT built because its
+    -- target-rate direction was reversed and remains unexplained.
+    -- EDA Q9 (consistency with POS): months before time zero only.
+    SELECT DISTINCT SK_ID_CURR, CAST(1 AS DOUBLE) AS has_credit_card
+    FROM credit_card_balance
+    WHERE MONTHS_BALANCE < 0
+  ", "credit_card_balance")
+}
+
+#' Flag applicants with history that cannot be linked to previous_application
+#'
+#' Purpose: Identify applicants with decision-time-safe POS, installment, or credit-card
+#'   rows whose SK_ID_PREV does not exist anywhere in previous_application.
+#' Inputs:  con - DuckDB connection.
+#' Outputs: SK_ID_CURR, has_unmatched_history (1 for every returned applicant).
+#' Learns from data: No.
+aggregate_unmatched_history <- function(con) {
+  fetch_aggregate(con, "
+    WITH child AS (
+      -- The same decision-time filters as the aggregations above. An installment row counts
+      -- if it belongs to either installment population (paid by, or due by, time zero).
+      SELECT SK_ID_CURR, SK_ID_PREV FROM POS_CASH_balance WHERE MONTHS_BALANCE < 0
+      UNION ALL
+      SELECT SK_ID_CURR, SK_ID_PREV FROM installments_payments
+      WHERE DAYS_ENTRY_PAYMENT <= 0 OR DAYS_INSTALMENT <= 0
+      UNION ALL
+      SELECT SK_ID_CURR, SK_ID_PREV FROM credit_card_balance WHERE MONTHS_BALANCE < 0
+    )
+    -- EDA Q4 and final review: unmatched history is a provenance state of its own, so
+    -- it is checked against the full previous_application table, not the time-filtered view.
+    SELECT DISTINCT c.SK_ID_CURR, CAST(1 AS DOUBLE) AS has_unmatched_history
+    FROM child c
+    LEFT JOIN (SELECT DISTINCT SK_ID_PREV FROM previous_application) p
+      ON c.SK_ID_PREV = p.SK_ID_PREV
+    WHERE p.SK_ID_PREV IS NULL
+  ", "unmatched_history")
+}
+```
+
+Credit-card history contributes only a coverage flag. The EDA's sensitivity check showed that higher credit-card DPD went with *lower* target rates, and it did not explain the reversal. Promoting that flag now would build an unexplained relationship into the model.
+
+# Joins
+
+`join_supplementary()` attaches every aggregate to an application table with left joins only. It then converts "no row in this source" into explicit states, so absence of history never becomes a silent median value.
+
+```{r}
+#| label: join-supplementary
+
+#' Encode a source's delinquency as distinct history states
+#'
+#' Purpose: Keep no history, history where delinquency could not be measured, history
+#'   without delinquency, and delinquency apart.
+#' Inputs:  has_source - 0/1 coverage flag; delinquent - 0/1 flag, or NA when the source
+#'          has history but nothing to measure delinquency from.
+#' Outputs: "no_history", "history_delinquency_unmeasured", "delinquent", or
+#'          "history_no_delinquency".
+#' Learns from data: No.
+delinquency_state <- function(has_source, delinquent) {
+  # EDA Q7 and final review: no history, history without delinquency, and delinquency
+  # are different populations, so they must not be collapsed by imputation.
+  case_when(
+    has_source == 0 ~ "no_history",
+    # EDA Q7 (missing, absent, and zero kept separate): history exists but delinquency
+    # could not be measured, so "no delinquency" has NOT been established.
+    is.na(delinquent) ~ "history_delinquency_unmeasured",
+    delinquent == 1 ~ "delinquent",
+    TRUE ~ "history_no_delinquency"
+  )
+}
+
+#' Join supplementary aggregates to an application table
+#'
+#' Purpose: Left-join all applicant-level aggregates, build coverage and history-state
+#'   features, and check that the applicant grain is unchanged.
+#' Inputs:  app - output of engineer_application_features();
+#'          bureau, previous, installments, pos, credit_card, unmatched - aggregate tables.
+#' Outputs: app with every supplementary feature; same rows and row order as app.
+#' Learns from data: No.
+join_supplementary <- function(app, bureau, previous, installments, pos,
+                               credit_card, unmatched) {
+  n_in <- nrow(app)
+
+  out <- app |>
+    # EDA Q4: LEFT joins on SK_ID_CURR only. Inner joins would drop applicants without history.
+    left_join(bureau, by = "SK_ID_CURR") |>
+    left_join(previous, by = "SK_ID_CURR") |>
+    left_join(installments, by = "SK_ID_CURR") |>
+    left_join(pos, by = "SK_ID_CURR") |>
+    left_join(credit_card, by = "SK_ID_CURR") |>
+    left_join(unmatched, by = "SK_ID_CURR") |>
+    mutate(
+      # EDA Q7: one coverage flag per source, recorded before any fill so "no history" is explicit.
+      has_bureau = as.integer(!is.na(bureau_record_count)),
+      has_previous_application = as.integer(!is.na(prev_approved_count)),
+      # Installment coverage = a payment observed by time zero OR an installment due by time zero.
+      has_installments = as.integer(!is.na(inst_payment_events) | !is.na(inst_due_schedules)),
+      has_pos = as.integer(!is.na(pos_delinquent)),
+      has_credit_card = as.integer(!is.na(has_credit_card)),
+      # EDA Q7: number of the five sources with any decision-time history.
+      sources_present = has_bureau + has_previous_application + has_installments +
+        has_pos + has_credit_card,
+      # EDA Q7: strict thin-file flag = no records in ANY of the five sources.
+      # Not the same as "no bureau record" (10.1% vs 7.1% target rate in the EDA).
+      no_history_any_source = as.integer(sources_present == 0),
+      # EDA Q4 and final review: history rows that do not link to previous_application.
+      has_unmatched_history = as.integer(!is.na(has_unmatched_history)),
+
+      # EDA Q7: categorical delinquency-state features (bureau, installments, POS only).
+      # Bureau and POS always yield a 0/1 flag when history exists, so in practice they
+      # use three states.
+      bureau_delinquency_state = delinquency_state(has_bureau, bureau_delinquent),
+      # Installments can also be "history_delinquency_unmeasured": due installments but no
+      # payment observed by time zero, so delinquency (measured on payments) is unknown.
+      # Their unpaid amount shows up in inst_shortfall_total.
+      inst_delinquency_state = delinquency_state(has_installments, inst_delinquent),
+      pos_delinquency_state = delinquency_state(has_pos, pos_delinquent),
+
+      # Not from EDA: standard practice (confirmed in the preparation review). Counts for an
+      # applicant with no rows in a source are a true 0, not missing. Amounts and timings stay
+      # NA and are median-imputed in the recipe; the coverage flags keep "no history" distinct.
+      across(
+        c(bureau_record_count, bureau_balance_month_rows,
+          prev_approved_count, prev_refused_count, prev_canceled_count, prev_unused_count,
+          prev_first_drawing_sentinel_count, prev_first_due_sentinel_count,
+          prev_last_due_1st_version_sentinel_count, prev_last_due_sentinel_count,
+          prev_termination_sentinel_count,
+          inst_payment_events, inst_late30_events, inst_due_schedules,
+          inst_underpaid_schedules, inst_schedule_conflict),
+        ~ coalesce(.x, 0)
+      ),
+
+      # EDA Q7: bureau depth bands 0 / 1 / 2-4 / 5+ (1 record: 8.6%; 2+: about 7.5%).
+      bureau_depth_band = case_when(
+        bureau_record_count == 0 ~ "depth_0",
+        bureau_record_count == 1 ~ "depth_1",
+        bureau_record_count <= 4 ~ "depth_2_4",
+        TRUE ~ "depth_5_plus"
+      ),
+
+      # EDA final review: total bureau debt divided by reported income. This is a debt STOCK
+      # proxy, NOT a monthly DTI (the data has no complete monthly payment obligations).
+      bureau_debt_to_income = safe_divide(bureau_total_debt, AMT_INCOME_TOTAL)
+    ) |>
+    # The 0/1 delinquency columns are NA for no-history applicants. They are replaced by the
+    # categorical state versions so imputation cannot merge "no history" or "unmeasured"
+    # into "not delinquent".
+    select(-bureau_delinquent, -inst_delinquent, -pos_delinquent)
+
+  # EDA Q4: the joins must not add or drop applicants.
+  stopifnot(
+    "row count changed during joins" = nrow(out) == n_in,
+    "SK_ID_CURR is not unique after joins" = !anyDuplicated(out$SK_ID_CURR),
+    "row order changed during joins" = identical(out$SK_ID_CURR, app$SK_ID_CURR)
+  )
+  out
+}
+```
+
+The main design choice is that no-history applicants get their meaning from explicit flags and states, not from filled-in numbers. A count of zero is a real zero. A missing debt total is still missing, and `has_bureau = 0` says why.
+
+# Recipe
+
+## A custom step for train-learned caps
+
+Q11 decided to compare raw, `log1p`, and training-derived capped versions of the skewed amounts during validation, and not to delete extreme values. `recipes` has no built-in step that learns quantile caps and adds them as new columns, so `step_cap_quantile()` implements that. Its `prep()` method learns the 1st and 99th percentiles from training data and stores them in the step. Its `bake()` method applies those stored values to whatever data it receives, including the test set.
+
+```{r}
+#| label: step-cap-quantile
+
+#' Train-learned quantile capping (winsorizing) as a recipes step
+#'
+#' Purpose: Learn lower/upper percentile caps from the training data in prep(), store
+#'   them, and add *_cap copies in bake(). The raw columns are left unchanged.
+#' Inputs:  recipe; ... - column selectors; lower, upper - probabilities (default 1st/99th);
+#'          suffix - name suffix for the capped copies.
+#' Outputs: An updated recipe. After prep(), the step holds the learned caps in $caps.
+#' Learns from data: YES - the caps come from the training data only.
+step_cap_quantile <- function(recipe, ..., role = "predictor", trained = FALSE,
+                              lower = 0.01, upper = 0.99, caps = NULL,
+                              suffix = "_cap", skip = FALSE,
+                              id = rand_id("cap_quantile")) {
+  add_step(
+    recipe,
+    step_cap_quantile_new(
+      terms = enquos(...), role = role, trained = trained,
+      lower = lower, upper = upper, caps = caps, suffix = suffix,
+      skip = skip, id = id
+    )
+  )
+}
+
+#' Constructor for the step object
+#'
+#' Purpose: Build a step_cap_quantile object; used by step_cap_quantile() and by prep().
+#' Inputs:  the step's fields (terms, role, trained, lower, upper, caps, suffix, skip, id).
+#' Outputs: A recipes step of subclass "cap_quantile".
+#' Learns from data: No.
+step_cap_quantile_new <- function(terms, role, trained, lower, upper, caps,
+                                  suffix, skip, id) {
+  step(
+    subclass = "cap_quantile", terms = terms, role = role, trained = trained,
+    lower = lower, upper = upper, caps = caps, suffix = suffix,
+    skip = skip, id = id
+  )
+}
+
+#' prep() method: learn the caps
+#'
+#' Purpose: The ONLY place the caps are estimated; it only ever sees the training data.
+#' Inputs:  x - the untrained step; training - the training data; info - recipe variable info.
+#' Outputs: A trained step whose $caps holds c(lower, upper) for each selected column.
+#' Learns from data: YES - percentiles of the training data (NA values ignored).
+prep.step_cap_quantile <- function(x, training, info = NULL, ...) {
+  col_names <- recipes_eval_select(x$terms, training, info)
+  check_type(training[, col_names], types = c("double", "integer"))
+  caps <- lapply(col_names, function(col) {
+    stats::quantile(training[[col]], probs = c(x$lower, x$upper),
+                    na.rm = TRUE, names = FALSE)
+  })
+  names(caps) <- col_names
+  step_cap_quantile_new(
+    terms = x$terms, role = x$role, trained = TRUE,
+    lower = x$lower, upper = x$upper, caps = caps, suffix = x$suffix,
+    skip = x$skip, id = x$id
+  )
+}
+
+#' bake() method: apply the stored caps
+#'
+#' Purpose: Add a *_cap copy of each column using the caps stored at prep() time.
+#' Inputs:  object - the trained step; new_data - training or test data.
+#' Outputs: new_data with the *_cap columns added; the raw columns are unchanged.
+#' Learns from data: No - nothing is recomputed from new_data.
+bake.step_cap_quantile <- function(object, new_data, ...) {
+  col_names <- names(object$caps)
+  check_new_data(col_names, object, new_data)
+  for (col in col_names) {
+    limits <- object$caps[[col]]
+    # NA stays NA; the recipe's median imputation handles it later.
+    new_data[[paste0(col, object$suffix)]] <- pmin(pmax(new_data[[col]], limits[1]), limits[2])
+  }
+  new_data
+}
+
+#' print() method
+#'
+#' Purpose: One-line description of the step when the recipe is printed.
+#' Inputs:  x - the step; width - console width.
+#' Outputs: invisible(x); prints the step summary.
+#' Learns from data: No.
+print.step_cap_quantile <- function(x, width = max(20, options()$width - 35), ...) {
+  title <- sprintf("Quantile caps (%.0f%% / %.0f%%, train-learned) for ",
+                   100 * x$lower, 100 * x$upper)
+  print_step(names(x$caps), x$terms, x$trained, title, width)
+  invisible(x)
+}
+
+#' tidy() method: report the learned caps
+#'
+#' Purpose: Expose the stored caps, which is the evidence for "store and reuse".
+#' Inputs:  x - the step (trained or untrained).
+#' Outputs: A tibble with terms, lower_prob, upper_prob, lower_cap, upper_cap, id
+#'          (caps are NA before prep()).
+#' Learns from data: No.
+tidy.step_cap_quantile <- function(x, ...) {
+  if (is_trained(x)) {
+    res <- tibble::tibble(
+      terms = names(x$caps),
+      lower_prob = x$lower,
+      upper_prob = x$upper,
+      lower_cap = vapply(x$caps, function(v) v[1], numeric(1), USE.NAMES = FALSE),
+      upper_cap = vapply(x$caps, function(v) v[2], numeric(1), USE.NAMES = FALSE)
+    )
+  } else {
+    res <- tibble::tibble(
+      terms = sel2char(x$terms), lower_prob = x$lower, upper_prob = x$upper,
+      lower_cap = NA_real_, upper_cap = NA_real_
+    )
+  }
+  res$id <- x$id
+  res
+}
+
+#' required_pkgs() method
+#'
+#' Purpose: Declare the packages needed to bake this step (used by parallel workers).
+#' Inputs:  x - the step.
+#' Outputs: Character vector of package names.
+#' Learns from data: No.
+required_pkgs.step_cap_quantile <- function(x, ...) c("recipes", "stats")
+
+# Not from EDA: standard practice. Register the methods explicitly so dispatch works
+# no matter which environment Quarto evaluates the chunks in. A saved recipe that
+# contains this step needs these definitions loaded before it is baked in a new session.
+registerS3method("prep", "step_cap_quantile", prep.step_cap_quantile, envir = asNamespace("recipes"))
+registerS3method("bake", "step_cap_quantile", bake.step_cap_quantile, envir = asNamespace("recipes"))
+registerS3method("print", "step_cap_quantile", print.step_cap_quantile)
+registerS3method("tidy", "step_cap_quantile", tidy.step_cap_quantile, envir = asNamespace("generics"))
+registerS3method("required_pkgs", "step_cap_quantile", required_pkgs.step_cap_quantile,
+                 envir = asNamespace("generics"))
+```
+
+## The preprocessing recipe
+
+Every learned value is estimated in `prep()` on the training table. `bake()` then applies the stored values to training and test alike. Estimating a median, cap, or bin edge on the test data, or on train and test combined, would let the scoring population shape its own preprocessing. That would break the EDA's final-review control of "a single fitted preprocessing recipe".
+
+```{r}
+#| label: build-recipe
+
+#' Build the train-fitted preprocessing recipe
+#'
+#' Purpose: Define roles and every data-learned preprocessing step.
+#' Inputs:  train_joined - the joined TRAINING table (defines the columns and roles).
+#' Outputs: An unprepped recipe. Call prep() on train only, then bake() on both.
+#' Learns from data: Defining it learns nothing; prep() learns caps, bin cutoffs,
+#'   medians, and factor levels from the training data.
+build_prep_recipe <- function(train_joined) {
+  # Informed by EDA Q13, which asked for legal, policy, and disparity review before these
+  # fields are used; the audit-only role (kept in the output for subgroup and fairness
+  # checks, NEVER used as predictors) was selected during preparation as a conservative default.
+  audit_fixed <- c(
+    "CODE_GENDER", "CODE_GENDER_XNA",
+    "DAYS_BIRTH",
+    # EDA Q13: age is audit-only for now. ECOA / Regulation B (US) allows age in an
+    # empirically derived scoring system if applicants aged 62+ are not scored less
+    # favorably, so age_years can be promoted later with a one-line role change.
+    # Home Credit's own jurisdiction may apply different rules.
+    "age_years",
+    "NAME_FAMILY_STATUS", "CNT_CHILDREN",
+    # Decision from the preparation review: CNT_FAM_MEMBERS is roughly CNT_CHILDREN plus a
+    # partner, so as a predictor it would bring both audited fields back in.
+    "CNT_FAM_MEMBERS",
+    "OCCUPATION_TYPE",
+    "ORGANIZATION_TYPE", "ORGANIZATION_TYPE_XNA",
+    "NAME_EDUCATION_TYPE", "NAME_HOUSING_TYPE"
+  )
+  # Informed by EDA Q13 (geography can proxy protected characteristics); making every
+  # region/city field audit-only was selected during preparation.
+  audit_geo <- grep(
+    "^(REGION_|REG_REGION_|REG_CITY_|LIVE_REGION_|LIVE_CITY_)",
+    names(train_joined), value = TRUE
+  )
+  audit_vars <- intersect(c(audit_fixed, audit_geo), names(train_joined))
+
+  amount_vars <- c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE")
+
+  recipe(TARGET ~ ., data = train_joined) |>
+    # EDA Q1: the identifier is kept for joins and submission, never used as a predictor.
+    update_role(SK_ID_CURR, new_role = "id") |>
+    # Informed by EDA Q13; audit role selected during preparation. Carried through bake(),
+    # excluded from every *_predictors() selector.
+    update_role(all_of(audit_vars), new_role = "audit") |>
+    # EDA Q3: the schedule-conflict flag is kept as a data-quality check. It is expected to be
+    # constant (the EDA found no conflicts), so it is kept out of the predictors.
+    update_role(inst_schedule_conflict, new_role = "quality_check") |>
+
+    # Step order and why it matters:
+    # 1. Caps and log1p come first, so they are computed from the observed amounts
+    #    before any imputed value exists.
+    # EDA Q11: train-learned 1st/99th percentile caps as *_cap copies; raw columns kept.
+    step_cap_quantile(all_of(amount_vars), lower = 0.01, upper = 0.99, id = "cap_amounts") |>
+    # EDA Q11: log1p versions, so raw, log1p, and capped forms can be compared in validation.
+    step_mutate(
+      AMT_INCOME_TOTAL_log1p = log1p(AMT_INCOME_TOTAL),
+      AMT_CREDIT_log1p = log1p(AMT_CREDIT),
+      AMT_ANNUITY_log1p = log1p(AMT_ANNUITY),
+      AMT_GOODS_PRICE_log1p = log1p(AMT_GOODS_PRICE),
+      id = "log1p_amounts"
+    ) |>
+
+    # 2. Binning: copy the ratio so the continuous version stays available.
+    # EDA Q12: bins are learned on train with quantiles, never the EDA quintiles as fixed
+    # cutoffs. Not from EDA: 5 bins, to match the EDA's
+    # granularity. NA ratios go to their own "bin_missing" level, which sorts first and so
+    # becomes the step_dummy reference level (a missing ratio = all bin dummies 0).
+    # bin_missing is created by step_discretize itself (discretize() defaults to
+    # keep_na = TRUE), not by the later step_unknown, so no NA reaches step_unknown here.
+    step_mutate(financing_to_goods_bin = financing_to_goods, id = "copy_financing_to_goods") |>
+    step_discretize(financing_to_goods_bin, num_breaks = 5, min_unique = 10,
+                    id = "bin_financing_to_goods") |>
+
+    # 3. Missing indicators BEFORE imputation; otherwise imputation erases the signal.
+    # EDA Q7: meaningful missingness gets its own indicator.
+    # EDA Q10: EXT_SOURCE_1 missingness differs by 14.3 points between train (56.4%) and
+    # test (42.1%), so the indicator also documents a known population shift.
+    step_indicate_na(EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3, OWN_CAR_AGE,
+                     id = "indicate_missing") |>
+
+    # 4. EDA Q7: numeric imputation values are medians learned from the TRAINING data only.
+    #    Tiny missing groups (e.g., 12 AMT_ANNUITY rows) get no custom rule.
+    step_impute_median(all_numeric_predictors(), id = "impute_median") |>
+
+    # 5. EDA Q6: levels are fixed by the training data. Any new test/future value goes to
+    #    OTHER_UNSEEN instead of disappearing. It must come BEFORE step_unknown: in bake(),
+    #    step_unknown turns any level unseen in training into NA, so running it first would
+    #    silently merge unseen values with missing ones. It must also come before step_dummy.
+    #    EDA Q6: NO step_other - recorded labels are preserved, rare ones included.
+    step_novel(all_nominal_predictors(), new_level = "OTHER_UNSEEN", id = "novel_level") |>
+
+    # 6. EDA Q7: a missing category becomes its own "unknown" level, not the most common level.
+    step_unknown(all_nominal_predictors(), new_level = "unknown", id = "unknown_level") |>
+
+    # 7. Not from EDA: standard practice. Indicator columns for the nominal predictors
+    #    (the first level is the reference).
+    step_dummy(all_nominal_predictors(), id = "dummy") |>
+
+    # 8. EDA Q12: the affordability effects differ by
+    #    contract type, so each ratio gets a revolving-loan interaction.
+    step_interact(
+      terms = ~ starts_with("NAME_CONTRACT_TYPE_Revolving"):annuity_to_income +
+        starts_with("NAME_CONTRACT_TYPE_Revolving"):credit_to_income +
+        starts_with("NAME_CONTRACT_TYPE_Revolving"):financing_to_goods,
+      id = "contract_interactions"
+    ) |>
+
+    # 9. Not from EDA: standard practice. Drop predictors that are constant in training.
+    #    EDA Q6: the OTHER_UNSEEN dummies are constant in training BY CONSTRUCTION. They are
+    #    exempt so an unseen test value stays explicit and does not fall into the reference level.
+    step_zv(all_predictors(), -contains("OTHER_UNSEEN"), id = "zero_variance")
+}
+```
+
+Order matters in three places. The indicators come before imputation; otherwise every missing `EXT_SOURCE_1` would look observed. `step_novel` comes before both `step_unknown` and `step_dummy`. If `step_unknown` ran first, it would turn unseen test labels into `NA` and then into `unknown`, merging "never seen" with "missing". With `step_novel` first, an unseen label has its own column to land in. The zero-variance filter exempts those `OTHER_UNSEEN` columns, because in training they are zero by definition. Without the exemption, the filter would silently undo the Q6 decision.
+
+This recipe is fit on the full training table. When models are tuned with cross-validation, the *unprepped* recipe should go inside the resampling workflow so that medians and caps are relearned within each fold. The saved prepped recipe is for producing the final train and test tables.
+
+# Run pipeline
+
+## Consistency checks
+
+`validate_consistency()` is defined before the pipeline because `run_pipeline()` calls it right after baking, *before* anything is written. If an assertion fails, the render stops and `data/processed` keeps its previous contents; it never receives a set of files that failed validation.
+
+```{r}
+#| label: validate-function
+
+#' Validate train/test consistency of the prepared data
+#'
+#' Purpose: Assert train/test consistency on the final outputs.
+#' Inputs:  train_out, test_out - baked outputs; train_in, test_in - joined inputs;
+#'          rec_prepped - the prepped recipe (used to read the final column roles).
+#' Outputs: invisible(TRUE); stops with a named message on the first failed check.
+#' Learns from data: No.
+validate_consistency <- function(train_out, test_out, train_in, test_in, rec_prepped) {
+  roles <- summary(rec_prepped)
+  predictors <- roles$variable[roles$role == "predictor"]
+  audit <- roles$variable[roles$role == "audit"]
+  shared <- intersect(names(train_out), names(test_out))
+  class_of <- function(df) vapply(df[shared], function(x) class(x)[1], character(1))
+  factor_cols <- shared[vapply(train_out[shared], is.factor, logical(1))]
+
+  # Name the offending columns so a failure points straight at its cause.
+  for (pop in list(list("train", train_out), list("test", test_out))) {
+    na_cols <- predictors[vapply(pop[[2]][predictors], anyNA, logical(1))]
+    if (length(na_cols)) {
+      stop(sprintf("NA values in %s predictors: %s", pop[[1]], paste(na_cols, collapse = ", ")))
+    }
+  }
+  # Every predictor must be numeric after baking; a logical or character predictor was
+  # skipped by the imputation and dummy steps.
+  non_numeric <- predictors[!vapply(train_out[predictors], is.numeric, logical(1))]
+  if (length(non_numeric)) {
+    stop(sprintf("Non-numeric predictors after baking: %s", paste(non_numeric, collapse = ", ")))
+  }
+
+  stopifnot(
+    # Identical columns except TARGET.
+    "train must have exactly one extra column, TARGET" =
+      identical(setdiff(names(train_out), names(test_out)), "TARGET"),
+    "test must have no columns that train lacks" =
+      length(setdiff(names(test_out), names(train_out))) == 0,
+    "shared columns must be in the same order" =
+      identical(names(test_out), setdiff(names(train_out), "TARGET")),
+    # Identical column types (and identical factor levels).
+    "column classes differ between train and test" =
+      identical(class_of(train_out), class_of(test_out)),
+    "factor levels differ between train and test" =
+      all(vapply(factor_cols, function(f) identical(levels(train_out[[f]]),
+                                                    levels(test_out[[f]])), logical(1))),
+    # EDA Q2, Q4: the applicant grain is unchanged.
+    "train row count changed" = nrow(train_out) == nrow(train_in),
+    "test row count changed" = nrow(test_out) == nrow(test_in),
+    "train SK_ID_CURR not unique" = !anyDuplicated(train_out$SK_ID_CURR),
+    "test SK_ID_CURR not unique" = !anyDuplicated(test_out$SK_ID_CURR),
+    "train row order changed" = identical(train_out$SK_ID_CURR, train_in$SK_ID_CURR),
+    "test row order changed" = identical(test_out$SK_ID_CURR, test_in$SK_ID_CURR),
+    # EDA Q7: every predictor is complete after the train-learned imputation.
+    "NA values in train predictors" = !anyNA(train_out[predictors]),
+    "NA values in test predictors" = !anyNA(test_out[predictors]),
+    # EDA final review: TARGET is never available in the scoring data.
+    "TARGET must be absent from test" = !"TARGET" %in% names(test_out),
+    # EDA Q13: audit fields survive in both outputs, and none of them is a predictor.
+    "audit columns missing" = length(audit) > 0 &&
+      all(audit %in% names(train_out)) && all(audit %in% names(test_out)),
+    "an audit field became a predictor" = !any(audit %in% predictors)
+  )
+  invisible(TRUE)
+}
+```
+
+## Pipeline
+
+```{r}
+#| label: run-pipeline-function
+
+#' Run the full preparation pipeline
+#'
+#' Purpose: Build the joined train and test tables with identical functions, fit the recipe
+#'   on train only, bake both, validate, and only then save the recipe, the prepared data,
+#'   and the predictor manifest.
+#' Inputs:  con - DuckDB connection; out_dir - output folder (data/processed).
+#' Outputs: A list with train_in/test_in (joined, pre-recipe), train_out/test_out (baked),
+#'          rec_prepped, predictor_names, and output_format. Writes files to out_dir only
+#'          if validate_consistency() passes.
+#' Learns from data: Yes, but only through prep() on the training table.
+run_pipeline <- function(con, out_dir) {
+  # Supplementary aggregates are computed once and shared by both populations (fixed rules, no fitting).
+  aggregates <- list(
+    bureau = aggregate_bureau(con),
+    previous = aggregate_previous(con),
+    installments = aggregate_installments(con),
+    pos = aggregate_pos(con),
+    credit_card = aggregate_credit_card(con),
+    unmatched = aggregate_unmatched_history(con)
+  )
+
+  #' Build one joined application table
+  #'
+  #' Purpose: Read one application table and run it through the shared cleaning,
+  #'   feature, and join functions, so train and test go through identical code.
+  #' Inputs:  table_name - "application_train" or "application_test".
+  #' Outputs: The joined, pre-recipe table (one row per SK_ID_CURR).
+  #' Learns from data: No.
+  build_joined <- function(table_name) {
+    dbGetQuery(con, sprintf("SELECT * FROM %s", dbQuoteIdentifier(con, table_name))) |>
+      clean_application() |>
+      engineer_application_features() |>
+      (\(app) do.call(join_supplementary, c(list(app = app), aggregates)))()
+  }
+  train_in <- build_joined("application_train")
+  test_in <- build_joined("application_test")
+
+  # Learn every preprocessing parameter from TRAIN only ...
+  rec_prepped <- prep(build_prep_recipe(train_in), training = train_in, retain = TRUE)
+  # ... then apply the stored parameters unchanged to both populations.
+  train_out <- bake(rec_prepped, new_data = NULL)
+  test_out <- bake(rec_prepped, new_data = test_in)
+
+  # Not from EDA: standard practice. Validate BEFORE writing anything, so a failed check
+  # can never leave a set of files that failed validation in data/processed.
+  validate_consistency(train_out, test_out, train_in, test_in, rec_prepped)
+
+  # Not from EDA: standard practice. Recipe roles do not travel with a plain data frame, so
+  # the predictor list is saved separately. Modeling code must select these names explicitly;
+  # otherwise audit, id, and quality_check columns could be used as predictors by mistake.
+  predictor_names <- summary(rec_prepped) |>
+    filter(role == "predictor") |>
+    pull(variable)
+
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  saveRDS(predictor_names, file.path(out_dir, "predictor_names.rds"))
+  # The prepped recipe stores the learned caps, cutoffs, medians, and levels for reuse.
+  saveRDS(rec_prepped, file.path(out_dir, "prep_recipe.rds"))
+  # .rds copies keep exact R column types (factors, integers) for the modeling notebook.
+  saveRDS(train_out, file.path(out_dir, "train_prepared.rds"))
+  saveRDS(test_out, file.path(out_dir, "test_prepared.rds"))
+  if (requireNamespace("arrow", quietly = TRUE)) {
+    arrow::write_parquet(train_out, file.path(out_dir, "train_prepared.parquet"))
+    arrow::write_parquet(test_out, file.path(out_dir, "test_prepared.parquet"))
+    output_format <- "parquet"
+  } else {
+    write.csv(train_out, file.path(out_dir, "train_prepared.csv"), row.names = FALSE)
+    write.csv(test_out, file.path(out_dir, "test_prepared.csv"), row.names = FALSE)
+    output_format <- "csv"
+  }
+
+  list(
+    train_in = train_in, test_in = test_in,
+    train_out = train_out, test_out = test_out,
+    rec_prepped = rec_prepped, predictor_names = predictor_names,
+    output_format = output_format
+  )
+}
+```
+
+The prepared tables mix predictors with audit, id, and quality-check columns, and a plain data frame does not remember which is which. `predictor_names.rds` is the list the modeling notebook should use to select predictors, for example `train_out[, c(predictor_names, "TARGET")]`.
+
+```{r}
+#| label: run-pipeline
+
+result <- run_pipeline(con, processed_dir)
+train_in <- result$train_in
+test_in <- result$test_in
+train_out <- result$train_out
+test_out <- result$test_out
+rec_prepped <- result$rec_prepped
+predictor_names <- result$predictor_names
+
+pipeline_summary <- data.frame(
+  table = c("train (joined, pre-recipe)", "test (joined, pre-recipe)",
+            "train (prepared)", "test (prepared)"),
+  rows = fmt_int(c(nrow(train_in), nrow(test_in), nrow(train_out), nrow(test_out))),
+  columns = c(ncol(train_in), ncol(test_in), ncol(train_out), ncol(test_out))
+)
+kable_clean(pipeline_summary, caption = sprintf(
+  "Pipeline output sizes (files written to data/processed as %s and .rds)", result$output_format
+))
+
+role_counts <- as.data.frame(table(role = summary(rec_prepped)$role))
+names(role_counts)[2] <- "columns"
+kable_clean(role_counts, caption = "Columns by recipe role in the prepared output")
+```
+
+The prepared tables keep the applicant grain. The column counts differ by exactly one: `TARGET` exists only in training.
+
+```{r}
+#| label: history-states
+
+# Descriptive check: the delinquency states and the strict no-history flag stay
+# distinct after the joins (training data, so TARGET rates can be shown).
+history_states <- do.call(rbind, lapply(
+  c("bureau_delinquency_state", "inst_delinquency_state", "pos_delinquency_state"),
+  function(field) {
+    train_in |>
+      group_by(state = .data[[field]]) |>
+      summarise(applicants = n(), target_rate = mean(TARGET), .groups = "drop") |>
+      mutate(feature = field, .before = 1)
+  }
+))
+kable_clean(history_states, caption = "Training applicants and TARGET rate by delinquency-state feature")
+
+kable_clean(
+  train_in |>
+    group_by(no_history_any_source, has_unmatched_history) |>
+    summarise(applicants = n(), target_rate = mean(TARGET), .groups = "drop"),
+  caption = "Strict no-history and unmatched-history flags in training"
+)
+```
+
+These tables re-check the Q7 finding after the decision-time filters. The EDA computed its coverage rates before filtering, so small differences from the EDA figures (for example, the 2,200 strict no-history applicants) are expected. The more important check is direction. In the EDA, delinquent bureau, installment, and POS histories had higher target rates than histories without measured delinquency, and this table shows whether that still holds once the decision-time filters are applied.
+
+# Validation
+
+`run_pipeline()` has already run `validate_consistency()` on the baked tables, and it wrote files to `data/processed` only after every assertion passed. The table below records the checks that passed.
+
+```{r}
+#| label: validate
+
+validation_summary <- data.frame(
+  check = c(
+    "Only TARGET differs between train and test columns",
+    "Identical column classes and factor levels",
+    "Row counts and row order match inputs; SK_ID_CURR unique",
+    "No NA values in predictor columns",
+    "TARGET absent from test",
+    "Audit columns present in both outputs and never predictors"
+  ),
+  result = "Passed"
+)
+kable_clean(validation_summary, caption = "Train/test consistency assertions")
+
+#' Count applicants with at least one unseen category
+#'
+#' Purpose: Count ROWS, not dummy activations: one applicant with unseen values in two
+#'   fields is counted once.
+#' Inputs:  df - a baked table.
+#' Outputs: Number of rows with any OTHER_UNSEEN dummy equal to 1.
+#' Learns from data: No.
+count_unseen_rows <- function(df) {
+  unseen <- select(df, contains("OTHER_UNSEEN"))
+  sum(rowSums(unseen == 1) > 0)
+}
+
+kable_clean(
+  data.frame(
+    population = c("train", "test"),
+    predictors = length(predictor_names),
+    audit = sum(summary(rec_prepped)$role == "audit"),
+    unseen_rows = c(count_unseen_rows(train_out), count_unseen_rows(test_out))
+  ),
+  caption = "Predictor/audit counts and applicants with at least one OTHER_UNSEEN value"
+)
+```
+
+The `OTHER_UNSEEN` count is zero in training by construction. A non-zero count in test is the number of scoring applicants with at least one label that training never saw. Those values now land in an explicit column instead of silently joining the reference level.
+
+## Evidence of stored, train-learned parameters
+
+The values below live inside the saved `prep_recipe.rds`. `bake()` reuses them for the test set; it never recomputes them.
+
+```{r}
+#| label: learned-parameters
+
+kable_clean(
+  tidy(rec_prepped, id = "cap_amounts") |> select(-id),
+  caption = "Train-learned percentile caps (step_cap_quantile)", digits = 2
+)
+
+bin_cutoffs <- tidy(rec_prepped, id = "bin_financing_to_goods") |> select(-id)
+kable_clean(bin_cutoffs, caption = "Train-learned quantile cutoffs for financing_to_goods_bin", digits = 4)
+
+medians <- tidy(rec_prepped, id = "impute_median") |> select(-id)
+kable_clean(
+  medians[medians$terms %in% c(
+    "AMT_ANNUITY", "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "OWN_CAR_AGE",
+    "employment_years", "annuity_to_income", "credit_to_income", "financing_to_goods",
+    "bureau_total_debt", "bureau_debt_to_income", "inst_days_late_mean",
+    grep("^AMT_REQ_CREDIT_BUREAU_", medians$terms, value = TRUE)
+  ), ],
+  caption = sprintf("Selected train-learned imputation medians (%d numeric predictors in total)",
+                    nrow(medians)),
+  digits = 4
+)
+
+novel_levels <- tidy(rec_prepped, id = "novel_level") |> select(-id)
+kable_clean(novel_levels, caption = "Nominal predictors protected by the OTHER_UNSEEN level")
+```
+
+Most `AMT_REQ_CREDIT_BUREAU_*` medians are likely 0, so imputation effectively fills those fields with zero. That is acceptable only because `AMT_REQ_CREDIT_BUREAU_MISSING` keeps the missing state separate, as Q7 required.
+
+## Proxy overlap check
+
+```{r}
+#| label: proxy-overlap
+
+# The employment sentinel is a predictor (EDA Q8 requires the flag), but it may largely
+# duplicate the audit-only ORGANIZATION_TYPE indicator and track pensioners (and therefore age).
+proxy_overlap <- train_in |>
+  mutate(pensioner = as.integer(NAME_INCOME_TYPE %in% "Pensioner")) |>
+  count(DAYS_EMPLOYED_SENTINEL, ORGANIZATION_TYPE_XNA, pensioner, name = "applicants") |>
+  mutate(share = applicants / sum(applicants))
+kable_clean(proxy_overlap, caption = "Overlap of the employment sentinel, organization placeholder, and pensioner status")
+```
+
+If the sentinel flag and `ORGANIZATION_TYPE_XNA` agree for almost every applicant, then moving the organization indicator to the audit role does little on its own: the predictor set still contains the same information through `DAYS_EMPLOYED_SENTINEL`. I keep the sentinel as a predictor because Q8 requires the flag, but its subgroup impact, including by age, belongs in the fairness review during validation.
+
+# Summary of transformations
+
+| Transformation | EDA question | Rationale |
+|---|---|---|
+| `DAYS_EMPLOYED` 365243 → NA, plus `DAYS_EMPLOYED_SENTINEL` | Q8, Q11 | Undocumented sentinel; keep the signal, remove the fake duration |
+| `DAYS_*` → positive years (`age_years`, `employment_years`, ...); raw duplicates dropped | Q11 | Interpretable units; raw copies were exact duplicates |
+| `CODE_GENDER` / `ORGANIZATION_TYPE` XNA → field-specific unknown level + indicator | Q6 | Non-structural placeholders handled one column at a time |
+| `OWN_CAR_AGE_GT50` flag, value unchanged | Q11 | Plausibility issue for review, not deletion |
+| `AMT_REQ_CREDIT_BUREAU_MISSING`; NAs not zero-filled | Q7 | Missing (10.3%) ≠ zero inquiries (7.7%) |
+| `annuity_to_income`, `credit_to_income`, `financing_to_goods` (NA on zero denominator) | Q12 | Approved repayment-capacity proxies |
+| Bureau: `DAYS_CREDIT <= 0 AND DAYS_CREDIT_UPDATE <= 0`; balance `MONTHS_BALANCE < 0` | Q9 | Decision-time-safe records only |
+| Bureau record count, depth band (0/1/2-4/5+), total debt, delinquency | Q7 | Depth and delinquency separated risk in the EDA |
+| `bureau_debt_to_income` labeled as a debt stock proxy | Final review | Not a monthly DTI |
+| `bureau_balance_month_rows` | Not from EDA | Observable bureau payment history; standard practice |
+| Previous: `DAYS_DECISION <= 0`; sentinels → NULL + flags; realized dates only if `<= 0` | Q8, Q9 | Timing and sentinel rules enforced in `previous_clean` |
+| XAP and structural XNA kept as recorded | Q6, Q8 | Structural "not applicable" categories |
+| Previous-application counts by status | Informed by Q6, Q9; selected during preparation | Prior application outcomes as supplementary features |
+| Previous-application sentinel counts | Q8 | Field-specific sentinel signal kept |
+| Installments split into payments observed by time zero and installments due by time zero; no deduplication | Q3, Q9 | Known payments and known obligations are different questions; repeated rows are separate payment events |
+| Installment totals, event counts, latest payment, conflict flag | Q3 | Payment behavior and schedule integrity |
+| Installment mean/max days late; total shortfall and underpaid count (unpaid due rows included); due-installment count | Informed by Q3; statistics selected during preparation | Timing and amount gaps at event and schedule level |
+| Installment / POS / bureau delinquency (30+ days) | Q7 | Consistent risk direction in the EDA |
+| Credit card: presence only | Q7 | Reversed delinquency direction; not promoted |
+| LEFT joins on `SK_ID_CURR`; grain assertions | Q4 | Inner joins would drop applicants |
+| Coverage flags, `sources_present`, `no_history_any_source`, `has_unmatched_history` | Q4, Q7, final review | Distinct history populations |
+| Categorical delinquency states: `no_history`, `history_no_delinquency`, `delinquent`, plus `history_delinquency_unmeasured` (installments with due obligations but no observed payment) | Q7, final review | No history ≠ unmeasured ≠ no delinquency ≠ delinquent |
+| Counts → 0 for no-history; amounts/timings → train median | Preparation review | A true zero count vs. unknown amount |
+| Audit role for gender, age, family, children, family size, occupation, organization, education, housing, geography | Informed by Q13; audit-only role selected during preparation | Q13 required review before use; excluding them until that review is done is the conservative choice |
+| `step_cap_quantile` (1st/99th, train-learned) + `*_log1p` | Q11 | Compare raw, log, and capped forms in validation |
+| `financing_to_goods_bin` via train-learned quantile bins | Q12 | No fixed EDA cutoffs |
+| `step_indicate_na` on `EXT_SOURCE_1/2/3`, `OWN_CAR_AGE` (before imputation) | Q7, Q10 | Preserve missingness signal; EXT_SOURCE_1 shift |
+| Train-learned median imputation | Q7 | No test information in imputation |
+| `unknown` level for missing categories | Q7 | Missing category kept as its own state |
+| `OTHER_UNSEEN` level; no rare-level lumping | Q6 | Train-defined levels; recorded labels preserved |
+| Dummies; zero-variance filter exempting `OTHER_UNSEEN` | Not from EDA; Q6 | Standard encoding without undoing Q6 |
+| Revolving-loan × affordability-ratio interactions | Q12 | Effects differ by contract type |
+| `inst_schedule_conflict` in `quality_check` role | Q3 | Kept for monitoring, expected constant |
+| Integer → double casting | Not from EDA | Identical train/test column types |
+| BOOLEAN removed from DuckDB type guessing (`EMERGENCYSTATE_MODE` stays "Yes"/"No") | Not from EDA; Q6 | A logical column would bypass imputation and encoding; recorded labels preserved |
+| Validation before any file is written; `predictor_names.rds` manifest; raw-file checks | Not from EDA | Standard practice: no files that failed validation, explicit predictor selection, early failure |
+
+: Transformations, their EDA source, and rationale
+
+## Known limitations
+
+- Installment rows with a `NULL` payment date are treated as "no payment observed" and count toward shortfall. The EDA did not establish their meaning, so this interpretation should be checked in validation. They are deliberately not counted as delinquent.
+- The installment populations differ from the EDA's Q7 query, which required both dates to be ≤ 0. Installment coverage, counts, and delinquency rates will therefore not match the EDA tables exactly.
+- Coverage and delinquency states use decision-time-filtered records, so their counts can differ slightly from the EDA's unfiltered Q7 tables.
+- Modeling code must select predictors with `predictor_names.rds`. Selecting "every column except TARGET" would include audit and id fields.
+- The saved recipe is fit on all of the training data. Model tuning should refit the unprepped recipe inside each resample.
+- Raw, `log1p`, and capped amounts are all present on purpose (Q11). The modeling stage must choose among them rather than using all three together.
+- A saved recipe containing `step_cap_quantile` can only be baked in a session where the step's methods are defined (run the `step-cap-quantile` chunk first).
+
+# Use of AI
+
+I used AI as a working partner in this phase as I did in the EDA. I specified each transformation from the decisions recorded in my EDA, and the AI helped me translate them into reusable R and DuckDB functions and the custom recipes step. It also flagged conflicts I then resolved, such as the zero-variance filter silently removing the `OTHER_UNSEEN` columns. It tested the full pipeline on small synthetic tables built to include sentinels, placeholders, unseen categories, applicants with no history, zero denominators, and post-application dates. I reviewed the code and every comment against the EDA so that each choice either traces to an EDA question or is labeled as standard practice.
+
+```{r}
+#| label: disconnect
+#| include: false
+
+dbDisconnect(con, shutdown = TRUE)
+```
