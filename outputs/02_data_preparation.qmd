@@ -49,7 +49,7 @@ library(recipes)
 table_names <- c(
   "application_train", "application_test", "bureau", "bureau_balance",
   "previous_application", "POS_CASH_balance", "credit_card_balance",
-  "installments_payments", "sample_submission"
+  "installments_payments"
 )
 
 #' Locate the raw-data folder and confirm every required CSV is present
@@ -142,7 +142,7 @@ safe_divide <- function(numerator, denominator) {
 }
 ```
 
-The setup mirrors the EDA: the raw CSVs are exposed as DuckDB views, so every source is read the same way the EDA read it. Before any view is created, `locate_raw_data()` confirms that `data/raw` exists and that all nine CSVs are present, and it names any missing file. `safe_divide()` is defined once because several functions below use the same zero-denominator rule.
+The setup mirrors the EDA: the eight raw CSVs used by the pipeline are exposed as DuckDB views, so every source is read the same way the EDA read it. Before any view is created, `locate_raw_data()` confirms that `data/raw` exists and that all eight required CSVs are present, and it names any missing file. `sample_submission.csv` is not required because it is not used to create features or validate the prepared tables. `safe_divide()` is defined once because several functions below use the same zero-denominator rule.
 
 # Application cleaning
 
