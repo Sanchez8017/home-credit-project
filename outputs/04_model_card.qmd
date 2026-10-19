@@ -1,0 +1,938 @@
+---
+title: "Model Card: Home Credit Payment-Difficulty Risk Score"
+subtitle: "Native-missing XGBoost, version 1.0"
+author: "Alejo Sanchez"
+date: "19 October 2026"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: false
+    embed-resources: true
+    fig-width: 8
+    fig-height: 4.5
+    fig-align: center
+execute:
+  echo: false
+  warning: false
+  message: false
+references:
+- id: hcbv2019
+  type: report
+  title: "Home Credit B.V. FY2018 and Q1 2019 results announcement"
+  author:
+    - literal: "Home Credit B.V."
+  issued:
+    date-parts: [[2019, 6, 28]]
+  URL: "https://www.homecredit.net/wp-content/uploads/2022/11/190628-HCBV-FY18_Q1_2019-Results-Announcement.pdf"
+- id: hcfb2018
+  type: report
+  title: "IFRS consolidated results for the 12-month period ended 31 December 2017"
+  author:
+    - literal: "Home Credit & Finance Bank"
+  issued:
+    date-parts: [[2018]]
+  URL: "https://www.homecredit.net/wp-content/uploads/2022/11/ifrs-consolidated-results-for-the-12-month-period-ended-31-dec-2017.pdf"
+- id: zhang2012
+  type: article-journal
+  title: "Comparisons of linear regression and survival analysis using single and mixture distributions approaches in modelling LGD"
+  author:
+    - family: Zhang
+      given: Jie
+    - family: Thomas
+      given: Lyn C.
+  container-title: "International Journal of Forecasting"
+  volume: 28
+  issue: 1
+  page: "204-215"
+  issued:
+    date-parts: [[2012]]
+  URL: "https://eprints.soton.ac.uk/185279/1/recovery_paper-ijf_revised3.pdf"
+- id: dealmeida2009
+  type: article-journal
+  title: "Optimizing the collections process in consumer credit"
+  author:
+    - family: De Almeida Filho
+      given: Adiel T.
+    - family: Mues
+      given: Christophe
+    - family: Thomas
+      given: Lyn C.
+  container-title: "CORMSIS Discussion Paper 09-07, University of Southampton"
+  issued:
+    date-parts: [[2009, 6]]
+  URL: "https://eprints.soton.ac.uk/71322/1/CORMSIS-09-07.pdf"
+- id: bcbs_cre32
+  type: legislation
+  title: "Basel Framework CRE32: IRB approach — risk components for each asset class (paras. 32.6 and 32.58), version effective 1 January 2022"
+  author:
+    - literal: "Basel Committee on Banking Supervision"
+  issued:
+    date-parts: [[2022, 1, 1]]
+  URL: "https://www.bis.org/committees/bcbs/basel-framework/81366/chapter.pdf"
+- id: regb_1002_9
+  type: legislation
+  title: "12 CFR § 1002.9(b)(2), Regulation B: Notifications — statement of specific reasons"
+  author:
+    - literal: "Consumer Financial Protection Bureau"
+  URL: "https://www.law.cornell.edu/cfr/text/12/1002.9"
+- id: regb_2026
+  type: legislation
+  title: "Equal Credit Opportunity Act (Regulation B) final rule, 91 FR (22 April 2026), effective 21 July 2026"
+  author:
+    - literal: "Consumer Financial Protection Bureau"
+  issued:
+    date-parts: [[2026, 4, 22]]
+  URL: "https://www.federalregister.gov/documents/2026/04/22/2026-07804/equal-credit-opportunity-act-regulation-b"
+- id: eeoc_1607_4
+  type: legislation
+  title: "29 CFR § 1607.4(D), Uniform Guidelines on Employee Selection Procedures: adverse impact and the four-fifths rule"
+  author:
+    - literal: "Equal Employment Opportunity Commission"
+  URL: "https://www.law.cornell.edu/cfr/text/29/1607.4"
+- id: euaiact
+  type: legislation
+  title: "Regulation (EU) 2024/1689 (Artificial Intelligence Act), Annex III point 5(b)"
+  author:
+    - literal: "European Parliament and Council of the European Union"
+  issued:
+    date-parts: [[2024]]
+  URL: "https://eur-lex.europa.eu/eli/reg/2024/1689/oj"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# This notebook reuses the trained model and cached out-of-fold predictions
+# from 03_modeling.qmd. Nothing is retrained.
+
+required_packages <- c(
+  "knitr", "dplyr", "ggplot2", "workflows", "recipes", "parsnip",
+  "hardhat", "xgboost", "Matrix", "yardstick"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install before rendering: ", paste(missing_packages, collapse = ", "))
+}
+
+library(dplyr)
+library(ggplot2)
+
+knitr::opts_chunk$set(dev = "png", dpi = 150)
+theme_set(theme_minimal(base_size = 12))
+
+model_seed <- 20261008L
+set.seed(model_seed)
+
+root_candidates <- c(".", "..")
+project_root <- root_candidates[
+  file.exists(file.path(root_candidates, "data", "processed", "train_modeling_base.rds"))
+][1]
+if (is.na(project_root)) {
+  stop("Could not locate data/processed/train_modeling_base.rds.")
+}
+
+paths <- list(
+  workflow = file.path(project_root, "models", "selected_xgboost_workflow.rds"),
+  metadata = file.path(project_root, "models", "selected_xgboost_metadata.rds"),
+  base     = file.path(project_root, "data", "processed", "train_modeling_base.rds"),
+  oof      = file.path(project_root, "outputs", "modeling_results", "xgboost_native_missing.rds")
+)
+missing_paths <- names(paths)[!file.exists(unlist(paths))]
+if (length(missing_paths)) {
+  stop("Missing required artifact(s): ", paste(unlist(paths[missing_paths]), collapse = "; "))
+}
+
+# Custom recipe steps used by the fitted workflow must be defined before
+# predict() can bake new data.
+for (helper in c("modeling_functions.R", "modeling_recipes.R")) {
+  helper_path <- file.path(project_root, "R", helper)
+  if (file.exists(helper_path)) source(helper_path)
+}
+
+selected_workflow <- readRDS(paths$workflow)
+selected_metadata <- readRDS(paths$metadata)
+train_base        <- readRDS(paths$base)
+native_missing    <- readRDS(paths$oof)
+native_missing    <- if (!is.null(native_missing$value)) native_missing$value else native_missing
+
+# Kaggle leaderboard scores recorded in 03_modeling.qmd
+kaggle_public_score  <- 0.76189
+kaggle_private_score <- 0.75758
+
+# ---- Formatting helpers -------------------------------------------------
+pct  <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+num  <- function(x, d = 0) formatC(x, format = "f", digits = d, big.mark = ",")
+dec  <- function(x, d = 3) formatC(x, format = "f", digits = d)
+mill <- function(x, d = 0) paste0(formatC(x / 1e6, format = "f", digits = d, big.mark = ","), "M")
+```
+
+```{r}
+#| label: oof-data
+#| include: false
+
+# Out-of-fold (OOF) probabilities: each applicant is scored by a model that
+# never saw that applicant during training.
+oof <- native_missing$predictions
+stopifnot(
+  all(c(".row", ".pred_payment_difficulty") %in% names(oof)),
+  nrow(oof) == nrow(train_base),
+  !anyDuplicated(oof$.row)
+)
+oof <- oof[order(oof$.row), ]
+
+target_numeric <- function(x) {
+  if (is.factor(x) || is.character(x)) {
+    as.integer(as.character(x) %in% c("1", "payment_difficulty"))
+  } else {
+    as.integer(x == 1)
+  }
+}
+
+scored <- data.frame(
+  SK_ID_CURR          = train_base$SK_ID_CURR[oof$.row],
+  y                   = target_numeric(train_base$TARGET[oof$.row]),
+  p                   = oof$.pred_payment_difficulty,
+  loan                = as.numeric(train_base$AMT_CREDIT[oof$.row]),
+  CODE_GENDER         = as.character(train_base$CODE_GENDER[oof$.row]),
+  NAME_EDUCATION_TYPE = as.character(train_base$NAME_EDUCATION_TYPE[oof$.row]),
+  stringsAsFactors = FALSE
+)
+stopifnot(
+  identical(target_numeric(oof$TARGET), scored$y),
+  !anyNA(scored$p), !anyNA(scored$loan)
+)
+
+n_applicants <- nrow(scored)
+event_rate   <- mean(scored$y)
+per_100k     <- 1e5 / n_applicants
+
+# Fold-mean CV ROC-AUC (selection metric) and pooled OOF ROC-AUC
+fold_auc <- native_missing$metrics |>
+  filter(.metric == "roc_auc") |>
+  pull(.estimate)
+cv_auc_mean <- mean(fold_auc)
+cv_auc_se   <- sd(fold_auc) / sqrt(length(fold_auc))
+
+y_factor <- factor(ifelse(scored$y == 1, "payment_difficulty", "no_payment_difficulty"),
+                   levels = c("payment_difficulty", "no_payment_difficulty"))
+pooled_auc <- yardstick::roc_auc_vec(y_factor, scored$p, event_level = "first")
+brier      <- mean((scored$p - scored$y)^2)
+brier_ref  <- event_rate * (1 - event_rate)
+```
+
+```{r}
+#| label: economics
+#| include: false
+
+# ---- Cost assumptions (sourced; see Decision Threshold Analysis) --------
+base_profit_margin <- 0.158  # profit on a repaid loan, share of loan amount
+base_recovery_rate <- 0.42   # share of a defaulted balance recovered
+base_lgd           <- 1 - base_recovery_rate  # loss given default = 0.58
+
+# Deck's illustrative assumptions (Capstone Project Brief, slide 9)
+deck_profit_margin <- 0.10
+deck_lgd           <- 0.50
+
+# ---- Exact loan-weighted economics for every possible cutoff ------------
+# Declining the k highest-scoring applicants avoids their losses but forgoes
+# profit on the good customers among them. Relative to approving everyone:
+#   gain(k) = LGD * sum(loan of bad loans declined) - m * sum(loan of good loans declined)
+ord      <- order(scored$p, decreasing = TRUE)
+p_sorted <- scored$p[ord]
+cum_bad  <- cumsum(scored$loan[ord] * scored$y[ord])
+cum_good <- cumsum(scored$loan[ord] * (1 - scored$y[ord]))
+cum_nbad <- cumsum(scored$y[ord])
+
+gain_curve <- function(m, lgd) (lgd * cum_bad - m * cum_good) * per_100k
+
+approve_all_profit <- function(m, lgd) {
+  sum(scored$loan * ifelse(scored$y == 1, -lgd, m)) * per_100k
+}
+
+policy_at <- function(threshold, m = base_profit_margin, lgd = base_lgd) {
+  declined <- scored$p >= threshold
+  tp <- sum(declined & scored$y == 1)
+  fp <- sum(declined & scored$y == 0)
+  fn <- sum(!declined & scored$y == 1)
+  tn <- sum(!declined & scored$y == 0)
+  gain <- (lgd * sum(scored$loan[declined & scored$y == 1]) -
+           m * sum(scored$loan[declined & scored$y == 0])) * per_100k
+  data.frame(
+    threshold = threshold,
+    declined_share = mean(declined),
+    precision = if (tp + fp > 0) tp / (tp + fp) else NA_real_,
+    recall = tp / (tp + fn),
+    false_positive_rate = fp / (fp + tn),
+    approved_bad_rate = fn / (fn + tn),
+    bad_caught_per_100k = tp * per_100k,
+    good_declined_per_100k = fp * per_100k,
+    gain_per_100k = gain
+  )
+}
+
+# Chosen operating policy (matches the Capstone Project Brief):
+# route the riskiest 10% of applicants to review, counted as a decline.
+chosen_threshold <- unname(stats::quantile(scored$p, 0.90, type = 7))
+chosen <- policy_at(chosen_threshold)
+
+# Profit-maximizing cutoff under the sourced base case
+base_gain   <- gain_curve(base_profit_margin, base_lgd)
+k_opt       <- which.max(base_gain)
+opt_threshold <- p_sorted[k_opt]
+optimum     <- policy_at(opt_threshold)
+breakeven_threshold <- base_profit_margin / (base_profit_margin + base_lgd)
+
+base_profit_all <- approve_all_profit(base_profit_margin, base_lgd)
+
+# Fast-track lane from the deck: safest 30% of applicants
+fast_track_cut  <- unname(stats::quantile(scored$p, 0.30, type = 7))
+fast_track_rate <- mean(scored$y[scored$p <= fast_track_cut])
+
+# Confusion matrix at the chosen threshold
+declined_flag <- scored$p >= chosen_threshold
+cm <- c(
+  tp = sum(declined_flag & scored$y == 1), fp = sum(declined_flag & scored$y == 0),
+  fn = sum(!declined_flag & scored$y == 1), tn = sum(!declined_flag & scored$y == 0)
+)
+accuracy_at_threshold <- (cm[["tp"]] + cm[["tn"]]) / n_applicants
+
+# ---- Fairness at the chosen threshold (used in summary and Fairness) ----
+fair_table <- function(group_col, min_n = 100) {
+  scored |>
+    mutate(group = .data[[group_col]], declined = p >= chosen_threshold) |>
+    group_by(group) |>
+    summarise(
+      applicants = n(),
+      actual_rate = mean(y),
+      predicted_rate = mean(p),
+      approval_rate = 1 - mean(declined),
+      bad_rate_approved = mean(y[!declined]),
+      good_reviewed = mean(declined[y == 0]),
+      bad_caught = if (any(y == 1)) mean(declined[y == 1]) else NA_real_,
+      .groups = "drop"
+    ) |>
+    filter(applicants >= min_n) |>
+    mutate(approval_ratio = approval_rate / max(approval_rate)) |>
+    arrange(desc(applicants))
+}
+gender_tab <- fair_table("CODE_GENDER")
+edu_tab    <- fair_table("NAME_EDUCATION_TYPE")
+gender_tab$group <- dplyr::recode(gender_tab$group, F = "Women", M = "Men")
+n_gender_excluded <- sum(!scored$CODE_GENDER %in% c("F", "M"))
+min_air <- min(c(gender_tab$approval_ratio, edu_tab$approval_ratio))
+fr <- function(tab, g, col) tab[[col]][tab$group == g]
+
+# ---- Reconciliation with the deck's headline figure ---------------------
+avg_loan <- mean(scored$loan)
+deck_as_presented <- 2828 * 599e3 * deck_lgd - 7172 * 599e3 * deck_profit_margin
+deck_assumptions_weighted <- policy_at(chosen_threshold, deck_profit_margin, deck_lgd)$gain_per_100k
+
+# ---- Cost-assumption sensitivity (profit 10-20%, LGD 45-75%) ------------
+scenarios <- expand.grid(margin = c(0.10, base_profit_margin, 0.20), lgd = c(0.45, base_lgd, 0.75))
+scenario_results <- do.call(rbind, lapply(seq_len(nrow(scenarios)), function(i) {
+  m <- scenarios$margin[i]; l <- scenarios$lgd[i]
+  g <- gain_curve(m, l); k <- which.max(g)
+  data.frame(margin = m, lgd = l, opt_threshold = p_sorted[k], opt_share = k / n_applicants,
+             opt_gain = g[k], chosen_gain = policy_at(chosen_threshold, m, l)$gain_per_100k)
+}))
+scenario_results$chosen_share_of_opt <- scenario_results$chosen_gain / scenario_results$opt_gain
+```
+
+```{r}
+#| label: shap
+#| include: false
+
+# ---- SHAP values from the final fitted model (1,000-row sample) ---------
+engine <- workflows::extract_fit_engine(selected_workflow)
+
+# Predictor matrix exactly as the model saw it during fitting
+mold_predictors <- tryCatch(
+  workflows::extract_mold(selected_workflow)$predictors,
+  error = function(e) NULL
+)
+if (is.null(mold_predictors) || nrow(mold_predictors) != nrow(train_base)) {
+  mold_predictors <- recipes::bake(
+    workflows::extract_recipe(selected_workflow),
+    new_data = train_base,
+    recipes::all_predictors()
+  )
+}
+mold_predictors <- as.data.frame(mold_predictors)
+
+set.seed(model_seed)
+shap_rows <- sample.int(nrow(mold_predictors), 1000L)
+x_sample  <- as.matrix(mold_predictors[shap_rows, , drop = FALSE])
+storage.mode(x_sample) <- "double"
+
+# The workflow passed XGBoost a sparse matrix, so stored zeros are treated as
+# missing. Build both representations and keep the one that reproduces the
+# workflow's own predictions.
+to_dmatrix <- function(m, sparse) {
+  if (sparse) xgboost::xgb.DMatrix(methods::as(m, "CsparseMatrix"))
+  else xgboost::xgb.DMatrix(m, missing = NA)
+}
+
+workflow_prob <- tryCatch(
+  predict(selected_workflow, new_data = train_base[shap_rows, , drop = FALSE],
+          type = "prob")$.pred_payment_difficulty,
+  error = function(e) NULL
+)
+
+candidate_fit <- lapply(c(sparse = TRUE, dense = FALSE), function(sparse) {
+  raw <- predict(engine, to_dmatrix(x_sample, sparse))
+  prob <- if (!is.null(workflow_prob) &&
+              mean(abs((1 - raw) - workflow_prob)) < mean(abs(raw - workflow_prob))) 1 - raw else raw
+  list(
+    sparse = sparse,
+    prob = prob,
+    flipped = !identical(prob, raw),
+    error = if (is.null(workflow_prob)) abs(mean(prob) - event_rate) else max(abs(prob - workflow_prob))
+  )
+})
+best_fit <- candidate_fit[[which.min(vapply(candidate_fit, `[[`, numeric(1), "error"))]]
+shap_check_error <- best_fit$error
+if (!is.null(workflow_prob) && shap_check_error > 1e-4) {
+  stop("Engine predictions do not reproduce the workflow; SHAP values would be unreliable.")
+}
+used_sparse <- best_fit$sparse
+
+contrib <- predict(engine, to_dmatrix(x_sample, used_sparse), predcontrib = TRUE)
+contrib <- as.matrix(contrib)
+intercept_col <- which(colnames(contrib) %in% c("BIAS", "(Intercept)"))
+if (!length(intercept_col)) intercept_col <- ncol(contrib)
+shap <- contrib[, -intercept_col, drop = FALSE]
+if (best_fit$flipped) shap <- -shap  # express contributions toward payment difficulty
+colnames(shap) <- colnames(x_sample)
+
+shap_global <- data.frame(
+  feature = colnames(shap),
+  mean_abs_shap = colMeans(abs(shap)),
+  stringsAsFactors = FALSE
+) |>
+  arrange(desc(mean_abs_shap)) |>
+  mutate(share = mean_abs_shap / sum(mean_abs_shap))
+
+# Direction: does a higher value raise or lower predicted risk?
+direction_of <- function(feature) {
+  x <- x_sample[, feature]; s <- shap[, feature]; ok <- !is.na(x)
+  if (sum(ok) < 20 || stats::sd(x[ok]) == 0) return(NA_real_)
+  suppressWarnings(stats::cor(x[ok], s[ok], method = "spearman"))
+}
+shap_global$direction <- vapply(shap_global$feature, direction_of, numeric(1))
+
+ext_share  <- sum(shap_global$share[grepl("^EXT_SOURCE_", shap_global$feature)])
+hist_share <- sum(shap_global$share[grepl(
+  "^(inst_|prev_|bureau_|pos_|has_|sources_present|no_history_any_source)", shap_global$feature)])
+
+# Final-model probabilities for the sampled applicants (used for reason codes)
+sample_prob <- best_fit$prob
+```
+
+```{r}
+#| label: dictionary
+#| include: false
+
+# Plain-language names, risk direction, and draft denial reasons.
+# Directions were confirmed from the SHAP sample (see Explainability).
+feature_dictionary <- tibble::tribble(
+  ~feature, ~label, ~risk_rises_when, ~reason, ~use_as_reason,
+  "EXT_SOURCE_2", "External credit score 2", "Score is low",
+    "Low credit score from an external credit data source", "Yes, after source provenance is confirmed",
+  "EXT_SOURCE_3", "External credit score 3", "Score is low",
+    "Low credit score from an external credit data source", "Yes, after source provenance is confirmed",
+  "EXT_SOURCE_1", "External credit score 1", "Score is low or unavailable",
+    "Limited or unfavorable external credit history", "Yes, after source provenance is confirmed",
+  "inst_days_late_max", "Worst past installment delay (days)", "Delay is longer",
+    "Late payments on previous Home Credit loans", "Yes",
+  "inst_days_late_mean", "Average past installment delay (days)", "Delay is longer",
+    "Late payments on previous Home Credit loans", "Yes",
+  "employment_years", "Years in current job", "Tenure is short",
+    "Length of employment", "Yes",
+  "financing_to_goods", "Loan amount vs. price of goods", "Ratio is high",
+    "Amount financed is high relative to the price of the goods", "Yes",
+  "prev_refused_count", "Previously refused applications", "Count is high",
+    "Number of recent credit applications that were declined", "Yes",
+  "inst_total_paid", "Total repaid on previous Home Credit loans", "Amount is low",
+    "Limited repayment history with Home Credit", "Yes",
+  "OWN_CAR_AGE", "Age of owned car (years)", "Car is older",
+    "Value of reported assets", "Compliance review required",
+  "prev_first_drawing_sentinel_count", "Previous loans with no recorded first drawing", "Count is low",
+    "Limited history of completed loans with Home Credit", "Compliance review required",
+  "AMT_GOODS_PRICE", "Price of goods financed", "Price is low relative to the loan",
+    "Amount financed is high relative to the price of the goods", "Yes",
+  "prev_last_due_sentinel_count", "Previous loans with no recorded end date", "Count is high",
+    "Number of open or ongoing credit obligations", "Yes",
+  "bureau_debt_to_income", "Bureau debt-to-income", "Ratio is high",
+    "Existing debt is high relative to income", "Yes",
+  "bureau_total_debt", "Total debt reported by credit bureau", "Debt is high",
+    "Amount of existing debt", "Yes",
+  "AMT_ANNUITY", "Loan payment amount", "Payment is high",
+    "Requested payment is high relative to the loan profile", "Yes",
+  "AMT_ANNUITY_cap", "Loan payment amount (capped)", "Payment is high",
+    "Requested payment is high relative to the loan profile", "Yes",
+  "NAME_INCOME_TYPE_Working", "Income type: salaried employee", "Applicant is salaried (vs. pensioner or civil servant)",
+    "Source of income", "No: may act as an age proxy",
+  "FLAG_WORK_PHONE", "Work phone provided", "A work phone is provided",
+    "None", "No: no clear business rationale",
+  "bureau_record_count", "Number of credit bureau records", "Count is low",
+    "Limited credit history at credit bureau", "Yes",
+  "phone_change_years", "Years since phone number changed", "Change is recent",
+    "Recent change in contact information", "Compliance review required",
+  "id_publish_years", "Years since ID document issued", "Issue is recent",
+    "Recent change in identity documents", "Compliance review required",
+  "inst_latest_payment_days", "Days since latest installment payment", "Mixed",
+    "Limited recent repayment history with Home Credit", "Compliance review required",
+  "inst_due_schedules", "Number of scheduled installments", "Count is low",
+    "Limited repayment history with Home Credit", "Yes"
+)
+
+label_of <- function(f) {
+  hit <- feature_dictionary$label[match(f, feature_dictionary$feature)]
+  ifelse(is.na(hit), f, hit)
+}
+reason_of <- function(f) {
+  hit <- feature_dictionary$reason[match(f, feature_dictionary$feature)]
+  ifelse(is.na(hit), "Reason text not yet drafted", hit)
+}
+```
+
+# Executive summary
+
+::: {.callout-note appearance="simple"}
+**For:** senior credit-risk leadership deciding whether to deploy the score. **Reading time:** one page. The rest of this card is supporting detail.
+:::
+
+**Recommendation.** Approve a **90-day shadow-scoring pilot**. The score would rate every application, but no decision would change. If the pilot confirms the results below, use the score to route the **riskiest 10% of applicants** (score ≥ `r dec(chosen_threshold)`) to underwriter review. It should not make automatic approvals.
+
+**What the model does.** It ranks applicants by their risk of the competition's payment-difficulty outcome (`TARGET = 1`), which is not necessarily a legal or accounting default. It uses application data, three external credit scores, and repayment history from credit bureaus and Home Credit. On applicants it never saw in training, it ranks a struggling borrower above a repaying borrower `r pct(pooled_auc, 0)` of the time (ROC-AUC `r dec(cv_auc_mean)`). On Kaggle's held-out test set it scored `r dec(kaggle_public_score)` (public) and `r dec(kaggle_private_score)` (private), providing supportive external validation of ranking performance.
+
+**Expected financial impact at the chosen threshold, per 100,000 applications:**
+
+| | Approve everyone (today) | Review riskiest 10% |
+|---|---|---|
+| Payment problems caught before lending | none | `r num(chosen$bad_caught_per_100k)` (`r pct(chosen$recall, 0)` of all) |
+| Good customers sent to review | none | `r num(chosen$good_declined_per_100k)` |
+| Payment-difficulty rate on approved loans | `r pct(event_rate)` | `r pct(chosen$approved_bad_rate)` |
+| Net gain vs. today (currency units) | — | **+`r mill(chosen$gain_per_100k)`** (`r pct(chosen$gain_per_100k / base_profit_all)` more profit) |
+
+These figures assume a `r pct(base_profit_margin)` profit on a repaid loan and use a `r pct(base_lgd, 0)` loss-given-default proxy for a loan with the competition's payment-difficulty outcome, both from published sources. Each figure uses the applicant's actual loan amount. They treat review as a decline, which is the most conservative case.
+
+**Key caveats**
+
+- **The deck's 417M is an upper bound.** That figure came from illustrative assumptions applied to the average loan. With sourced assumptions the same policy is worth `r mill(chosen$gain_per_100k)`. The profit-maximizing cutoff (`r dec(opt_threshold)`) would add only `r mill(optimum$gain_per_100k - chosen$gain_per_100k)` more.
+- **The cutoff depends on the cost assumptions.** If Home Credit's real margins are high and losses low (20% profit, 45% loss), reviewing 10% would cost money rather than save it. Actual profit and recovery figures should be confirmed during the pilot.
+- **External scores need provenance.** About `r pct(ext_share, 0)` of what drives the score comes from three anonymized external scores. Their source must be confirmed before they can appear in a denial reason.
+- **Error rates differ across groups.** Approval rates pass the four-fifths screen (lowest ratio `r dec(min_air, 2)`). But among borrowers who would have repaid, men are sent to review more often than women (`r pct(fr(gender_tab, "Men", "good_reviewed"))` vs. `r pct(fr(gender_tab, "Women", "good_reviewed"))`). Applicants with incomplete higher education are reviewed about twice as often as university graduates (`r pct(fr(edu_tab, "Incomplete higher", "good_reviewed"))` vs. `r pct(fr(edu_tab, "Higher education", "good_reviewed"))`). The pilot should test whether these gaps reflect real risk or proxy effects.
+- **Past approvals only.** The model was built on loans Home Credit already approved. Its performance on applicants who would have been declined today is unknown.
+- **Exact zeros are treated as missing.** The sparse-matrix workflow prevents the model from distinguishing values such as “0 days late” from no data. Refit with a dense matrix and compare performance, calibration, and routing before go-live.
+
+# Model details
+
+```{r}
+#| label: table-details
+params <- selected_metadata$model_parameters
+details <- data.frame(
+  Item = c(
+    "Model", "Version", "Prediction", "Algorithm", "Training data",
+    "Inputs", "Missing values", "Class imbalance", "Settings",
+    "Validation", "Selection basis", "Artifacts"
+  ),
+  Description = c(
+    "Home Credit payment-difficulty risk score",
+    "1.0, fitted 12 October 2026 (03_modeling.qmd); seed 20261008",
+    "Probability of the competition's payment-difficulty outcome (TARGET = 1; not necessarily a legal or accounting default)",
+    "Gradient-boosted decision trees (XGBoost via tidymodels), binary logistic objective",
+    sprintf("%s past Home Credit applicants; %s had payment difficulty",
+            num(n_applicants), pct(event_rate, 2)),
+    sprintf("%s model columns derived from 142 application and repayment-history fields",
+            num(ncol(mold_predictors))),
+    "Native XGBoost missing-value routing (no imputation)",
+    "None; the observed 8% event rate was kept because weighting, downsampling and SMOTE lowered ROC-AUC",
+    sprintf("%s trees; depth %s; learning rate %s; %s of %s columns tried per split; minimum node size %s; %s of rows per tree",
+            params$trees, params$tree_depth, params$learn_rate, params$mtry,
+            num(ncol(mold_predictors)), params$min_n, pct(params$sample_size, 0)),
+    "Stratified 3-fold cross-validation with all learned preprocessing fitted inside each fold",
+    "Highest full-data cross-validated ROC-AUC among 13 modeling experiments",
+    "models/selected_xgboost_workflow.rds; models/selected_xgboost_metadata.rds (stored locally, not on GitHub)"
+  )
+)
+knitr::kable(details, col.names = c("", ""))
+```
+
+**Training data.** One row per past applicant, drawn from the application, three external credit scores, credit-bureau history, and Home Credit's records of previous applications, installments, POS/cash loans and credit cards. Only information available on the application date was used. Gender, age, family status, occupation, education, housing and region were **excluded from the inputs** and kept only to audit fairness.
+
+**How the model was chosen.** It was the best of 13 experiments run on the same three folds; the main ones are below. A version tuned on a 5,000-applicant sample was rejected because its gains did not hold on the full data.
+
+```{r}
+#| label: table-selection
+selection <- data.frame(
+  Model = c("Majority class (no skill)", "Simple logistic, 12 fields", "Ridge logistic, application data",
+            "XGBoost, application data", "Ridge logistic, application + history",
+            "XGBoost, application + history", "XGBoost, tuned on 5K sample",
+            "**XGBoost, application + history, native missing (selected)**"),
+  `CV ROC-AUC` = c("0.500", "0.733", "0.745", "0.751", "0.752", "0.766", "0.762", paste0("**", dec(cv_auc_mean), "**")),
+  check.names = FALSE
+)
+knitr::kable(selection, align = c("l", "r"))
+```
+
+# Intended use
+
+**Primary users.** Home Credit credit-risk and underwriting teams.
+
+**Decision it informs.** Which consumer-loan applications get extra underwriter review. Applicants scoring at or above `r dec(chosen_threshold)`, about the riskiest 10%, go to review. The project brief's fast-track lane for the safest 30% (score ≤ `r dec(fast_track_cut)`, `r pct(fast_track_rate)` payment-difficulty rate) is outside this card's tested scope.
+
+**Deployment path.** A 90-day shadow pilot first, in which the score is recorded but no decision changes. The pilot will assess score distributions and stability across all applicants, calibration among approved borrowers with observed outcomes, fairness in proposed routing, and the external scores' provenance. Live routing follows only if those checks are satisfactory.
+
+**Not designed for:** automatic approvals or declines without an underwriter; setting prices, limits or loan amounts; populations outside the training data, including applicants Home Credit declines today; causal explanations of why borrowers struggle; or any use of the excluded demographic fields.
+
+# Performance metrics
+
+```{r}
+#| label: table-performance
+perf <- data.frame(
+  Metric = c(
+    "ROC-AUC, 3-fold cross-validation (mean ± standard error)",
+    "ROC-AUC, pooled out-of-fold predictions",
+    "ROC-AUC, Kaggle public leaderboard",
+    "ROC-AUC, Kaggle private leaderboard",
+    sprintf("Precision at threshold %s", dec(chosen_threshold)),
+    sprintf("Recall at threshold %s", dec(chosen_threshold)),
+    sprintf("Accuracy at threshold %s", dec(chosen_threshold)),
+    "Brier score (lower is better)"
+  ),
+  Value = c(
+    sprintf("%s ± %s", dec(cv_auc_mean, 4), dec(cv_auc_se, 4)),
+    dec(pooled_auc, 4),
+    dec(kaggle_public_score, 5),
+    dec(kaggle_private_score, 5),
+    pct(chosen$precision),
+    pct(chosen$recall),
+    pct(accuracy_at_threshold),
+    sprintf("%s (constant-rate reference %s)", dec(brier, 5), dec(brier_ref, 5))
+  ),
+  `What it means` = c(
+    "How well the score ranks risky above safe applicants it did not train on",
+    "Same, calculated over all 307,511 applicants at once",
+    "Independent test applicants scored by Kaggle",
+    "Independent test applicants scored by Kaggle (final standings)",
+    "Share of applicants sent to review who actually had payment difficulty",
+    "Share of all payment-difficulty cases the review tier catches",
+    "Shown for completeness; misleading with an 8% event rate",
+    "Accuracy of the probabilities themselves"
+  ),
+  check.names = FALSE
+)
+knitr::kable(perf)
+```
+
+The similar Kaggle AUC provides supportive external validation of ranking performance on applicants outside the development data. Kaggle does not release test labels, so it cannot validate precision, recall, calibration, or fairness; those measures reported here come from out-of-fold predictions on the training data.
+
+**Outcomes at the chosen threshold** (all 307,511 out-of-fold predictions):
+
+```{r}
+#| label: table-confusion
+confusion <- data.frame(
+  ` ` = c("Sent to review (score ≥ threshold)", "Approved (score < threshold)"),
+  `Had payment difficulty` = c(num(cm[["tp"]]), num(cm[["fn"]])),
+  `Repaid` = c(num(cm[["fp"]]), num(cm[["tn"]])),
+  check.names = FALSE
+)
+knitr::kable(confusion, align = c("l", "r", "r"))
+```
+
+Because payment difficulty is rare, most reviewed applicants would have repaid. Still, about `r round(100 * chosen$precision)` in 100 would have struggled, `r sprintf("%.1f", chosen$precision / event_rate)` times the rate in a random 10% sample.
+
+```{r}
+#| label: fig-calibration
+#| fig-cap: "Predicted vs. actual payment-difficulty rate by risk decile (out-of-fold). Points on the dashed line are perfectly calibrated."
+calib <- scored |>
+  mutate(decile = dplyr::ntile(p, 10)) |>
+  group_by(decile) |>
+  summarise(predicted = mean(p), actual = mean(y), .groups = "drop")
+ggplot(calib, aes(predicted, actual)) +
+  geom_abline(linetype = "dashed", colour = "grey55") +
+  geom_line(colour = "#2c6fbb") +
+  geom_point(size = 2.5, colour = "#2c6fbb") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Average predicted risk", y = "Actual payment-difficulty rate")
+```
+
+Predicted and actual rates agree in every decile (overall `r pct(mean(scored$p), 2)` predicted vs. `r pct(event_rate, 2)` actual), so the probabilities can be used directly in the cost calculations below.
+
+# Decision threshold analysis
+
+## Cost assumptions
+
+The threshold balances two costs. Approving a borrower who struggles loses part of the loan. Declining a borrower who would have repaid forgoes the profit on that loan. The base case uses published figures. The dataset doesn't state its currency, so amounts are in **currency units**, not dollars.
+
+| Assumption | Base case | Range tested | Source |
+|---|---|---|---|
+| Profit on a repaid loan (share of loan amount) | `r pct(base_profit_margin)` | 10% – 20% | Home Credit B.V. net interest margin, FY2018 (15.8%). Its Russia/Kazakhstan bank reported 13.7% for FY2017 [@hcbv2019; @hcfb2018] |
+| Recovery-rate proxy for a payment-difficulty case | `r pct(base_recovery_rate, 0)` | 25% – 55% | Average recovery on 27,278 defaulted UK unsecured personal loans [@zhang2012]. Net recoveries on a European bank's defaulted consumer loans ranged from about 15% to 39% after collection costs [@dealmeida2009] |
+| Loss-given-default proxy (1 − recovery) | `r pct(base_lgd, 0)` | 45% – 75% | Basel's supervisory value for senior unsecured claims is 40% (corporates) to 45% (financial institutions). Its minimum for unsecured retail exposures is 30–50% [@bcbs_cre32]. These default-based values are assignment proxies for losses associated with `TARGET = 1`, not evidence that every payment-difficulty case is a legal or accounting default. |
+
+**Simplifications.** Net interest margin is an annual, portfolio-level figure. It is used here as a proxy for lifetime profit on one loan, before credit losses. Recovery and loss-given-default assumptions are also proxies applied to the competition's payment-difficulty outcome; `TARGET = 1` does not establish default. Operating costs, funding costs and the cost of manual review are not deducted. Recoveries are not discounted for time. Every amount is weighted by the applicant's actual loan (`AMT_CREDIT`).
+
+## How the threshold is found
+
+Declining a group of applicants **avoids** `r pct(base_lgd, 0)` of the loans to those who would have struggled. It also **forgoes** `r pct(base_profit_margin)` profit on the loans to those who would have repaid. With calibrated probabilities, declining a single applicant breaks even at
+
+$$
+p^{*} = \frac{\text{profit}}{\text{profit} + \text{LGD}} = \frac{0.158}{0.158 + 0.58} = `r dec(breakeven_threshold)`.
+$$
+
+The chart traces the actual net gain at every possible cutoff, using out-of-fold probabilities and real loan amounts.
+
+```{r}
+#| label: fig-threshold
+#| fig-cap: "Net gain vs. approving everyone, per 100,000 applications, by decision threshold (sourced base case)."
+grid_idx <- unique(round(seq(1, length(p_sorted), length.out = 4000)))
+curve_df <- data.frame(threshold = p_sorted[grid_idx], gain = base_gain[grid_idx]) |>
+  filter(threshold >= 0.10, threshold <= 0.6)
+markers <- data.frame(
+  threshold = c(chosen_threshold, opt_threshold),
+  label_x = c(chosen_threshold - 0.07, opt_threshold + 0.09),
+  gain = c(chosen$gain_per_100k, optimum$gain_per_100k),
+  label = c(sprintf("Chosen: riskiest 10%%\n(%s, +%s)", dec(chosen_threshold), mill(chosen$gain_per_100k)),
+            sprintf("Profit-maximizing\n(%s, +%s)", dec(opt_threshold), mill(optimum$gain_per_100k)))
+)
+ggplot(curve_df, aes(threshold, gain / 1e6)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(colour = "#2c6fbb", linewidth = 1) +
+  geom_vline(xintercept = breakeven_threshold, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = breakeven_threshold, y = min(curve_df$gain) / 1e6, hjust = -0.05, vjust = 0,
+           label = sprintf("break-even p* = %s", dec(breakeven_threshold)), size = 3.3, colour = "grey30") +
+  geom_point(data = markers, colour = c("#d1495b", "#1b7f5b"), size = 3) +
+  geom_label(data = markers, aes(x = label_x, label = label), size = 3, fill = "white") +
+  scale_x_continuous(breaks = seq(0, 0.6, 0.1)) +
+  labs(x = "Decision threshold (decline/review if score ≥ threshold)",
+       y = "Net gain (millions of currency units)")
+```
+
+The best cutoff is `r dec(opt_threshold)`, close to the break-even `r dec(breakeven_threshold)` (loan sizes vary, so the two differ slightly). The curve is flat near its peak. **The chosen cutoff of `r dec(chosen_threshold)` (riskiest 10%) earns `r pct(chosen$gain_per_100k / optimum$gain_per_100k, 0)` of the best achievable gain** and is simpler to staff and explain, so it is kept as the operating threshold, consistent with the project brief. In production the cutoff should stay fixed at `r dec(chosen_threshold)` rather than "the top 10%", which drifts if the applicant mix changes.
+
+## Sensitivity analysis
+
+```{r}
+#| label: table-sensitivity-threshold
+thresholds <- sort(unique(c(0.08, 0.10, 0.12, 0.15, chosen_threshold, opt_threshold, 0.25, 0.30, 0.40)))
+sens <- do.call(rbind, lapply(thresholds, policy_at))
+sens_display <- sens |>
+  transmute(
+    Threshold = ifelse(abs(threshold - chosen_threshold) < 1e-9, paste0("**", dec(threshold), " (chosen)**"),
+                ifelse(abs(threshold - opt_threshold) < 1e-9, paste0(dec(threshold), " (optimum)"), dec(threshold, 2))),
+    `Sent to review` = pct(declined_share),
+    Precision = pct(precision),
+    Recall = pct(recall),
+    `Problems caught / 100k` = num(bad_caught_per_100k),
+    `Good customers reviewed / 100k` = num(good_declined_per_100k),
+    `Bad rate on approved` = pct(approved_bad_rate),
+    `Net gain / 100k` = mill(gain_per_100k)
+  )
+knitr::kable(sens_display, align = c("l", rep("r", 7)))
+```
+
+Lower thresholds catch more problems but send many more good customers to review; below about 0.12 the policy does worse than approving everyone. Above 0.30 the review tier is too small to matter.
+
+**Cost assumptions.** Across the full range tested (profit 10–20%, loss given default 45–75%, nine combinations), the optimal threshold runs from `r dec(min(scenario_results$opt_threshold))` to `r dec(max(scenario_results$opt_threshold))`. Losses that are large relative to profit push it lower (review more); higher profit pushes it higher (review fewer). The 10% policy keeps at least 80% of the achievable gain in `r sum(scenario_results$chosen_share_of_opt >= 0.8)` of 9 combinations. It is weakest when profit is high relative to losses. `r if (any(scenario_results$chosen_gain < 0)) { w <- scenario_results[which.min(scenario_results$chosen_gain), ]; sprintf("At %s profit and %s loss given default it would lose %s per 100,000 applications compared with approving everyone, because it sends too many good customers to review.", pct(w$margin), pct(w$lgd, 0), mill(-w$chosen_gain)) } else ""` Confirming Home Credit's actual profit and recovery figures is therefore a condition for keeping the 10% cutoff.
+
+**Reconciling with the project brief.** The brief quoted about `r mill(deck_as_presented)` per 100,000 applications for this same policy, using illustrative assumptions (50% loss, 10% profit) and valuing every loan at the 599K average. With actual loan amounts, those same assumptions give `r mill(deck_assumptions_weighted)`, because the riskiest applicants borrow less than average. With the sourced assumptions the figure is `r mill(chosen$gain_per_100k)`. The model and policy are identical in all three; only the assumptions and the weighting differ.
+
+# Explainability
+
+## Which features drive the score
+
+SHAP splits each prediction into per-feature contributions, in log-odds of payment difficulty: positive values raised that applicant's risk, negative values lowered it. Values come from XGBoost's exact tree SHAP on the final model, for a random sample of `r num(nrow(shap))` applicants.
+
+```{r}
+#| label: fig-shap-bar
+#| fig-cap: "Top 15 features by average absolute SHAP value (1,000-applicant sample)."
+#| fig-height: 4.2
+top15 <- head(shap_global, 15) |>
+  mutate(label = factor(label_of(feature), levels = rev(label_of(feature))))
+ggplot(top15, aes(mean_abs_shap, label)) +
+  geom_col(fill = "#2c6fbb") +
+  geom_text(aes(label = pct(share)), hjust = -0.15, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Average |SHAP| (log-odds of payment difficulty)", y = NULL)
+```
+
+```{r}
+#| label: fig-shap-beeswarm
+#| fig-cap: "SHAP summary plot for the top 10 features. Each dot is one applicant; colour shows the feature's value relative to other applicants (grey = missing). Dots to the right raised predicted risk."
+#| fig-height: 4.5
+top12 <- head(shap_global$feature, 10)
+swarm <- do.call(rbind, lapply(top12, function(f) {
+  x <- x_sample[, f]
+  rank_x <- ifelse(is.na(x), NA_real_, (rank(x, na.last = "keep", ties.method = "average") - 1) /
+                   max(1, sum(!is.na(x)) - 1))
+  data.frame(feature = label_of(f), shap = shap[, f], value_rank = rank_x)
+}))
+swarm$feature <- factor(swarm$feature, levels = rev(label_of(top12)))
+ggplot(swarm, aes(shap, feature, colour = value_rank)) +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_jitter(height = 0.22, width = 0, size = 0.9, alpha = 0.7) +
+  scale_colour_gradient(low = "#2c6fbb", high = "#d1495b", na.value = "grey75",
+                        breaks = c(0, 1), labels = c("Low", "High"), name = "Feature value") +
+  labs(x = "SHAP value (impact on log-odds of payment difficulty)", y = NULL)
+```
+
+**Main findings**
+
+- **External credit scores dominate.** Low `EXT_SOURCE_2`, `EXT_SOURCE_3` and `EXT_SOURCE_1` values raise risk sharply; together they account for `r pct(ext_share, 0)` of total SHAP impact. Their meaning and provenance are undocumented, the model's largest explainability dependency.
+- **Repayment and credit history is next** (`r pct(hist_share, 0)` of impact), led by the worst past installment delay, previously refused applications, and loans still open.
+- **Affordability and stability matter.** Short job tenure, financing well above the goods price, and a high payment amount all raise risk.
+- **Missing values carry meaning.** A missing `EXT_SOURCE_1` slightly raises risk; missing job tenure (mostly pensioners) lowers it.
+
+These rankings match the XGBoost gain importance in `03_modeling.qmd`. SHAP shows how the model uses each feature, not cause and effect. Correlated features (for example, the payment amount and its capped copy) share credit, and rankings can shift slightly with a different sample.
+
+# Adverse action mapping
+
+Applicants who are denied credit must receive the **specific, principal reasons** for the decision. A statement that they "failed to achieve a qualifying score" is not enough [@regb_1002_9]. The table below turns the top predictive features into draft reason statements and flags which ones need compliance review before use.
+
+```{r}
+#| label: table-adverse-action
+aa <- head(shap_global, 10) |>
+  left_join(feature_dictionary, by = "feature") |>
+  transmute(
+    Rank = row_number(),
+    `Model feature` = paste0("`", feature, "`"),
+    `Plain-language meaning` = ifelse(is.na(label), feature, label),
+    `Risk rises when` = ifelse(is.na(risk_rises_when),
+                               ifelse(direction > 0, "Value is high", "Value is low"), risk_rises_when),
+    `Draft denial reason` = ifelse(is.na(reason), "To be drafted", reason),
+    `Suitable as a reason?` = ifelse(is.na(use_as_reason), "Compliance review required", use_as_reason)
+  )
+knitr::kable(aa)
+```
+
+**Generating reasons for one applicant.** Take the features with the largest *positive* SHAP values (those that raised that applicant's risk), map each to its reason, merge duplicates, skip features marked "No", and report the top four. Example notices for the three highest-risk sampled applicants, scored by the final model:
+
+```{r}
+#| label: reason-codes
+eligible <- feature_dictionary$feature[!grepl("^No", feature_dictionary$use_as_reason)]
+declined_sample <- which(sample_prob >= chosen_threshold)
+
+reasons_for <- function(i, n = 4) {
+  s <- shap[i, ]
+  s <- sort(s[s > 0 & names(s) %in% eligible], decreasing = TRUE)
+  head(unique(reason_of(names(s))), n)
+}
+reason_lists <- lapply(declined_sample, reasons_for)
+
+example_ids <- head(declined_sample[order(-sample_prob[declined_sample])], 3)
+examples <- data.frame(
+  Applicant = train_base$SK_ID_CURR[shap_rows[example_ids]],
+  `Predicted risk` = pct(sample_prob[example_ids]),
+  `Principal reasons (in order)` = vapply(example_ids, function(i) {
+    paste0(seq_along(reasons_for(i)), ". ", reasons_for(i), collapse = "<br>")
+  }, character(1)),
+  check.names = FALSE
+)
+reason_freq <- sort(table(unlist(reason_lists)), decreasing = TRUE)
+top_reason <- names(reason_freq)[1]
+top_reason_share <- as.numeric(reason_freq[1]) / length(declined_sample)
+```
+
+```{r}
+#| label: table-reason-examples
+knitr::kable(examples, escape = FALSE)
+```
+
+Across the `r length(declined_sample)` sampled applicants above the threshold, the most common principal reason is "`r top_reason`" (cited for `r pct(top_reason_share, 0)`).
+
+**Before live use:** compliance must approve every reason statement and confirm what the external scores measure. Income type (a possible age proxy) and "work phone provided" (no business rationale) are excluded from reasons and should also be tested for removal from the model. If the model changes, the mapping must be regenerated from its SHAP values.
+
+# Fairness analysis
+
+Gender and education are **not** model inputs; they were set aside for this audit. The tables compare outcomes at the chosen threshold using out-of-fold scores. The *approval ratio* is each group's approval rate divided by the highest group's; below 0.80 is a common warning sign (the "four-fifths rule" from employment-selection guidelines [@eeoc_1607_4]), used here as a screen, not a lending standard.
+
+```{r}
+#| label: fairness
+show_fair <- function(tab) {
+  tab |>
+    transmute(
+      Group = group,
+      Applicants = num(applicants),
+      `Actual rate` = pct(actual_rate),
+      `Predicted rate` = pct(predicted_rate),
+      `Approval rate` = pct(approval_rate),
+      `Approval ratio` = dec(approval_ratio, 2),
+      `Good customers sent to review` = pct(good_reviewed),
+      `Problems caught` = pct(bad_caught),
+      `Bad rate on approved` = pct(bad_rate_approved)
+    )
+}
+```
+
+## Approval rates by gender (`CODE_GENDER`)
+
+```{r}
+#| label: table-fair-gender
+knitr::kable(show_fair(gender_tab), align = c("l", rep("r", 8)))
+```
+
+`r n_gender_excluded` applicants with an unknown gender code are omitted as too few to report.
+
+## Approval rates by education (`NAME_EDUCATION_TYPE`)
+
+```{r}
+#| label: table-fair-education
+knitr::kable(show_fair(edu_tab), align = c("l", rep("r", 8)))
+```
+
+## Disparities and implications
+
+- **Approval rates pass the four-fifths screen** (lowest ratio `r dec(min_air, 2)`). Men are approved less often than women, and applicants without a university degree less often than graduates, largely mirroring differences in actual payment-difficulty rates.
+- **Error rates are less even.** Among borrowers who would have repaid, men are sent to review more often than women (`r pct(fr(gender_tab, "Men", "good_reviewed"))` vs. `r pct(fr(gender_tab, "Women", "good_reviewed"))`), and applicants with incomplete higher education about twice as often as graduates (`r pct(fr(edu_tab, "Incomplete higher", "good_reviewed"))` vs. `r pct(fr(edu_tab, "Higher education", "good_reviewed"))`). A good applicant's chance of extra scrutiny depends partly on group membership.
+- **The model narrows, rather than widens, the gender gap.** It under-predicts risk for men (`r pct(fr(gender_tab, "Men", "predicted_rate"))` predicted vs. `r pct(fr(gender_tab, "Men", "actual_rate"))` actual) and over-predicts for women (`r pct(fr(gender_tab, "Women", "predicted_rate"))` vs. `r pct(fr(gender_tab, "Women", "actual_rate"))`), so the higher review rate for men reflects their higher actual risk, not exaggeration by the model.
+- **Small groups.** "Academic degree" has only `r fr(edu_tab, "Academic degree", "applicants")` applicants, so its rates are directional at best.
+
+**Implications.** Excluding protected fields did not remove group differences; correlated inputs such as income type, job tenure and the external scores can still carry them. Using gender or a close proxy as a decision basis remains disparate treatment under U.S. fair lending law. Since July 2026, Regulation B no longer recognizes disparate-impact liability under federal ECOA [@regb_2026], but effects-based claims can still arise under state law, and the EU AI Act classifies credit scoring as high-risk, which applies to Home Credit's EU operations [@euaiact]. The pilot should monitor approval rates, error rates and calibration by gender, age band and education each quarter; test the model without income type; and investigate the under-25 group, which has the weakest ranking accuracy (ROC-AUC 0.715, from `03_modeling.qmd`).
+
+# Limitations and risks
+
+| Limitation | Where the model might fail | Mitigation |
+|---|---|---|
+| **Trained on approved loans only**; declined applicants have no outcome. | Scores for applicants unlike past customers, including today's declines, may be wrong. | The shadow pilot will assess score distribution, stability, calibration for approved borrowers, and fairness in proposed routing. Validating performance for applicants who would otherwise be declined requires a controlled lending experiment, approved-loan sample, or a documented reject-inference approach. |
+| **Anonymized external scores** provide about `r pct(ext_share, 0)` of the signal. | A vendor change could degrade performance silently, and related denial reasons can't be explained. | Confirm provenance; monitor each score's missing rate and distribution. |
+| **Zero is treated as missing.** The workflow passed XGBoost a sparse matrix, so an exact 0 (e.g., 0 days late) is handled like no data. | The model can't separate "no delinquency" from "no history" within a numeric field, partly undoing an EDA decision. | Refit with a dense matrix and compare before go-live. |
+| **No out-of-time validation**; folds were random. | Performance may degrade as the economy, pricing or product mix changes. | Validate on a later cohort; track ROC-AUC and calibration monthly. |
+| **Simplified economics**: annual net interest margin stands in for lifetime profit; operating, funding and review costs are excluded; review counts as decline. | The gain and the best threshold could differ. | Use Home Credit's product-level profit and recovery data; record review outcomes in the pilot. |
+| **Missing data**: no pricing, collateral, verified income, rejected-applicant outcomes or application dates. | The model can't price risk or detect drift over time. | Add these fields in the next version. |
+| **Below the project target** (ROC-AUC `r dec(cv_auc_mean)` vs. 0.79), with **uneven group performance** and unclosed robustness checks from modeling. | Most reviewed applicants would repay; under-25s are ranked least accurately. | Keep a human underwriter; monitor fairness quarterly; run the pending with-and-without tests. |
+
+# Appendix: reproducibility
+
+```{r}
+#| label: table-repro
+pkgs <- c("workflows", "recipes", "parsnip", "xgboost", "yardstick", "Matrix")
+repro <- data.frame(
+  Component = c("R", pkgs, "Random seed", "SHAP sample", "SHAP input check"),
+  Value = c(
+    paste(R.version$major, R.version$minor, sep = "."),
+    vapply(pkgs, function(p) as.character(utils::packageVersion(p)), character(1)),
+    as.character(model_seed),
+    sprintf("%s applicants drawn at random from %s", num(nrow(shap)), num(nrow(mold_predictors))),
+    sprintf("%s input reproduces the workflow's predictions (max difference %s)",
+            ifelse(used_sparse, "Sparse", "Dense"), formatC(shap_check_error, format = "e", digits = 1))
+  )
+)
+knitr::kable(repro, col.names = c("", ""))
+```
+
+This card reuses `models/selected_xgboost_workflow.rds`, the cached out-of-fold predictions in `outputs/modeling_results/xgboost_native_missing.rds`, and `data/processed/train_modeling_base.rds`, all produced by `03_modeling.qmd`. Nothing is retrained. These artifacts are kept locally and excluded from GitHub by `.gitignore`.
+
+# References
+
+::: {#refs}
+:::
