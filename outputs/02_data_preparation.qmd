@@ -1102,6 +1102,11 @@ run_pipeline <- function(con, out_dir) {
   saveRDS(predictor_names, file.path(out_dir, "predictor_names.rds"))
   # The prepped recipe stores the learned caps, cutoffs, medians, and levels for reuse.
   saveRDS(rec_prepped, file.path(out_dir, "prep_recipe.rds"))
+  # The joined, pre-recipe tables retain fixed decision-time cleaning and historical
+  # aggregation but no train-learned preprocessing. Modeling resamples use these files
+  # so caps, bins, medians, and category levels can be learned inside each analysis fold.
+  saveRDS(train_in, file.path(out_dir, "train_modeling_base.rds"))
+  saveRDS(test_in, file.path(out_dir, "test_modeling_base.rds"))
   # .rds copies keep exact R column types (factors, integers) for the modeling notebook.
   saveRDS(train_out, file.path(out_dir, "train_prepared.rds"))
   saveRDS(test_out, file.path(out_dir, "test_prepared.rds"))

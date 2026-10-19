@@ -1,0 +1,3494 @@
+---
+title: "Home Credit Modeling"
+author: "Alejo Sanchez"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    code-fold: true
+    code-summary: "Show modeling code"
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+**Purpose**
+
+This notebook develops and compares models that rank Home Credit applicants by the risk of payment difficulty. Its immediate objective is to outperform a simple benchmark on out-of-sample ROC-AUC and produce evidence that can support the business problem. `TARGET = 1` is described as observed payment difficulty, not as a regulatory definition of default.
+
+The modeling design follows the [data map](../01_data_map.qmd), [industry context](../02_industry_context.qmd), [EDA plan](../03_eda_plan.qmd), and completed [data preparation](02_data_preparation.qmd). It establishes the modeling contract, compares candidate algorithms, evaluates imbalance strategies, tunes and validates XGBoost, fits the selected model, and produces a submission-ready test score file.
+
+## Modeling design contract
+
+The earlier project work creates the following constraints for modeling:
+
+| Design area | Modeling rule | Source |
+|---|---|---|
+| Unit of analysis | Keep one row per current applicant. | Data map |
+| Outcome | Predict `TARGET`, interpreted as payment difficulty. | Data map and EDA plan |
+| Identifiers | Use `SK_ID_CURR` for alignment and auditing, never as a predictor. | Data map and EDA plan |
+| Timing | Use only information available when the current application was evaluated. | EDA plan |
+| Historical behavior | Exclude future realized payments, balances, terminations, and reporting updates. | EDA plan |
+| Missing history | Keep no history, unmeasured history, and no measured delinquency as distinct states. | EDA findings |
+| Governance | Do not promote sensitive or proxy fields to predictors without fairness and policy review. | Industry context and EDA findings |
+| Population shift | Apply transformations learned from training data unchanged to the scoring population. | EDA plan |
+| Primary metric | Compare models using out-of-sample ROC-AUC; report accuracy only as a secondary metric. | Industry context and EDA plan |
+| Validation | Use stratified 3-fold cross-validation during exploration. | Modeling assignment |
+| Business decisions | Do not select an approval threshold or claim an approval-rate lift without decision costs and the relevant applicant population. | Industry context and EDA plan |
+
+ROC-AUC of 0.79 is retained as a project performance target that must be validated. It is not treated as a universal industry standard. Model discrimination also does not by itself establish an appropriate approval threshold.
+
+# Section 1: Setup and prepared-data audit
+
+## Reproducible setup
+
+The audit reads the RDS outputs from data preparation because they preserve R column types exactly. The Parquet copies remain available for interoperability. A fixed seed is recorded now and will be reused when resamples and tuning candidates are generated in later sections.
+
+```{r}
+#| label: setup
+
+required_packages <- c("knitr", "digest")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following package(s) before rendering: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+model_seed <- 20261008L
+set.seed(model_seed)
+
+modeling_run_mode <- tolower(Sys.getenv("MODELING_RUN_MODE", "development"))
+if (!modeling_run_mode %in% c("development", "final")) {
+  stop("MODELING_RUN_MODE must be either 'development' or 'final'.")
+}
+
+# Recorded after uploading outputs/submission.csv to Kaggle.
+kaggle_public_score <- 0.76189
+kaggle_private_score <- 0.75758
+
+root_candidates <- c(".", "..")
+project_root <- root_candidates[
+  file.exists(file.path(root_candidates, "data", "processed", "train_prepared.rds"))
+][1]
+
+if (is.na(project_root)) {
+  stop(
+    "Could not locate data/processed/train_prepared.rds from the current working directory."
+  )
+}
+
+processed_dir <- file.path(project_root, "data", "processed")
+result_cache_dir <- file.path(project_root, "outputs", "modeling_results")
+dir.create(result_cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+analysis_cache_version <- "2026-10-09-runtime-v3"
+analysis_signature <- paste(
+  analysis_cache_version,
+  file.info(c(
+    file.path(project_root, "R", "modeling_functions.R"),
+    file.path(project_root, "R", "modeling_recipes.R"),
+    file.path(processed_dir, "train_modeling_base.rds")
+  ))$mtime,
+  sep = "|",
+  collapse = "|"
+)
+
+cached_modeling_result <- function(
+    name,
+    code,
+    spec_signature,
+    required_artifacts = character()) {
+  cache_path <- file.path(result_cache_dir, paste0(name, ".rds"))
+  cache_signature <- digest::digest(list(
+    analysis = analysis_signature,
+    specification = spec_signature
+  ))
+  artifacts_available <-
+    !length(required_artifacts) || all(file.exists(required_artifacts))
+  if (identical(modeling_run_mode, "development") &&
+      file.exists(cache_path) && artifacts_available) {
+    cached <- readRDS(cache_path)
+    if (identical(cached$signature, cache_signature)) {
+      return(cached$value)
+    }
+  }
+
+  value <- force(code)
+  saveRDS(
+    list(signature = cache_signature, value = value),
+    cache_path,
+    compress = FALSE
+  )
+  value
+}
+
+detected_cores <- parallel::detectCores(logical = FALSE)
+if (is.na(detected_cores)) detected_cores <- 1L
+requested_workers <- suppressWarnings(as.integer(Sys.getenv("MODELING_WORKERS", "1")))
+if (is.na(requested_workers) || requested_workers < 1L) requested_workers <- 1L
+parallel_workers <- min(requested_workers, max(1L, detected_cores - 1L))
+modeling_cluster <- NULL
+if (parallel_workers > 1L &&
+    requireNamespace("doParallel", quietly = TRUE) &&
+    requireNamespace("foreach", quietly = TRUE)) {
+  modeling_cluster <- parallel::makePSOCKcluster(parallel_workers)
+  doParallel::registerDoParallel(modeling_cluster)
+}
+resample_engine_threads <- if (is.null(modeling_cluster)) 4L else 1L
+required_files <- c(
+  "train_prepared.rds",
+  "test_prepared.rds",
+  "predictor_names.rds",
+  "prep_recipe.rds"
+)
+
+missing_files <- required_files[
+  !file.exists(file.path(processed_dir, required_files))
+]
+
+if (length(missing_files) > 0) {
+  stop(
+    "Missing required prepared-data file(s): ",
+    paste(missing_files, collapse = ", ")
+  )
+}
+
+train_prepared <- readRDS(file.path(processed_dir, "train_prepared.rds"))
+test_prepared <- readRDS(file.path(processed_dir, "test_prepared.rds"))
+predictor_names <- readRDS(file.path(processed_dir, "predictor_names.rds"))
+
+knitr::opts_chunk$set(
+  fig.align = "center",
+  out.width = "85%"
+)
+
+knitr::kable(
+  data.frame(
+    setting = c("Run mode", "Parallel resample workers", "Threads per resample fit"),
+    value = c(modeling_run_mode, parallel_workers, resample_engine_threads)
+  ),
+  caption = "Modeling runtime configuration"
+)
+```
+
+Only the compact audit results are displayed below. The large prepared tables are not printed.
+
+The notebook defaults to `development` mode. Completed expensive resampling results are loaded from `outputs/modeling_results` when their code-and-data signature matches. Set the `MODELING_RUN_MODE` environment variable to `final` for a clean final render that recomputes and refreshes every saved result. Full-data fits default to one resample worker with four engine threads because concurrent folds were memory-bound on this machine; `MODELING_WORKERS` can raise the resample-worker count on a higher-memory system. In either mode, the required comparisons still use stratified 3-fold cross-validation, and tuning still evaluates 20 configurations on the approximately 5,000-row tuning sample.
+
+## Applicant grain and target separation
+
+The data map requires one row per `SK_ID_CURR`, with `TARGET` available only for model development. The checks below stop the notebook if that grain or separation has been broken.
+
+```{r}
+#| label: audit-grain-target
+
+grain_checks <- c(
+  "Training ID is present" = "SK_ID_CURR" %in% names(train_prepared),
+  "Test ID is present" = "SK_ID_CURR" %in% names(test_prepared),
+  "Training IDs are complete" = !anyNA(train_prepared$SK_ID_CURR),
+  "Test IDs are complete" = !anyNA(test_prepared$SK_ID_CURR),
+  "Training IDs are unique" = !anyDuplicated(train_prepared$SK_ID_CURR),
+  "Test IDs are unique" = !anyDuplicated(test_prepared$SK_ID_CURR),
+  "Train and test IDs do not overlap" =
+    length(intersect(train_prepared$SK_ID_CURR, test_prepared$SK_ID_CURR)) == 0,
+  "TARGET is present in training" = "TARGET" %in% names(train_prepared),
+  "TARGET is absent from test" = !"TARGET" %in% names(test_prepared),
+  "TARGET contains only 0 and 1" =
+    setequal(sort(unique(train_prepared$TARGET)), c(0, 1))
+)
+
+if (!all(grain_checks)) {
+  stop(
+    "Prepared-data grain/target audit failed: ",
+    paste(names(grain_checks)[!grain_checks], collapse = "; ")
+  )
+}
+
+population_summary <- data.frame(
+  population = c("Training", "Test"),
+  applicants = c(nrow(train_prepared), nrow(test_prepared)),
+  columns = c(ncol(train_prepared), ncol(test_prepared)),
+  target_available = c("Yes", "No")
+)
+
+knitr::kable(
+  population_summary,
+  caption = "Prepared modeling populations",
+  format.args = list(big.mark = ",")
+)
+```
+
+The prepared populations retain the applicant-level grain. The one-column difference is expected because `TARGET` belongs only to training.
+
+## Predictor manifest and train/test compatibility
+
+The prepared tables contain predictors together with the applicant ID, governance-audit fields, and a quality-check field. The saved predictor manifest is therefore the authoritative allow-list. Selecting every field except `TARGET` would incorrectly introduce excluded fields into a model.
+
+```{r}
+#| label: audit-predictor-manifest
+
+non_predictor_train <- setdiff(
+  names(train_prepared),
+  c(predictor_names, "TARGET")
+)
+
+schema_checks <- c(
+  "Predictor names are unique" = !anyDuplicated(predictor_names),
+  "Every predictor is in training" = all(predictor_names %in% names(train_prepared)),
+  "Every predictor is in test" = all(predictor_names %in% names(test_prepared)),
+  "ID is excluded from predictors" = !"SK_ID_CURR" %in% predictor_names,
+  "TARGET is excluded from predictors" = !"TARGET" %in% predictor_names,
+  "Train/test columns differ only by TARGET" = setequal(
+    setdiff(names(train_prepared), "TARGET"),
+    names(test_prepared)
+  ),
+  "Predictor classes match" = identical(
+    vapply(train_prepared[predictor_names], class, character(1)),
+    vapply(test_prepared[predictor_names], class, character(1))
+  ),
+  "Training predictors are complete" = !anyNA(train_prepared[predictor_names]),
+  "Test predictors are complete" = !anyNA(test_prepared[predictor_names])
+)
+
+if (!all(schema_checks)) {
+  stop(
+    "Prepared-data predictor/schema audit failed: ",
+    paste(names(schema_checks)[!schema_checks], collapse = "; ")
+  )
+}
+
+role_summary <- data.frame(
+  role = c("Predictor", "Identifier / audit / quality check", "Outcome"),
+  training_columns = c(length(predictor_names), length(non_predictor_train), 1L),
+  modeling_use = c(
+    "Candidate model inputs",
+    "Alignment, subgroup audit, or data-quality review only",
+    "Observed training outcome"
+  )
+)
+
+knitr::kable(
+  role_summary,
+  caption = "Prepared columns by modeling role"
+)
+```
+
+This separation preserves the EDA's conservative treatment of gender, age, family structure, occupation, organization, education, housing, and geography. These fields remain available for later subgroup auditing but are not silently admitted as model inputs.
+
+## Target prevalence and imbalance
+
+```{r}
+#| label: audit-target-prevalence
+
+target_count <- table(
+  factor(
+    train_prepared$TARGET,
+    levels = c(0, 1),
+    labels = c("No observed payment difficulty", "Observed payment difficulty")
+  )
+)
+
+target_summary <- data.frame(
+  outcome = names(target_count),
+  applicants = as.integer(target_count),
+  share = as.integer(target_count) / sum(target_count)
+)
+
+knitr::kable(
+  target_summary,
+  digits = 4,
+  caption = "Training outcome distribution",
+  format.args = list(big.mark = ",")
+)
+```
+
+The positive class represents about 8% of training applicants, consistent with the EDA. A majority-class classifier will therefore appear strong on accuracy while providing no useful risk ranking. Later sections will report its accuracy and ROC-AUC explicitly, then compare candidate models primarily on cross-validated ROC-AUC.
+
+## Application and supplementary feature coverage
+
+The data map and preparation notebook identify the following decision-time-safe historical feature families. This audit confirms that each planned family is represented in the predictor manifest without displaying hundreds of individual columns.
+
+```{r}
+#| label: audit-feature-families
+
+feature_family_patterns <- list(
+  "Bureau credit history" = "^(bureau_|has_bureau$)",
+  "Previous applications" = "^(prev_|has_previous_application$)",
+  "Installment behavior" = "^(inst_|has_installments$)",
+  "POS/CASH history" = "^(pos_|has_pos$)",
+  "Credit-card history" = "^has_credit_card$",
+  "Cross-source coverage" =
+    "^(has_unmatched_history$|sources_present$|no_history_any_source$)"
+)
+
+family_counts <- vapply(
+  feature_family_patterns,
+  function(pattern) sum(grepl(pattern, predictor_names)),
+  integer(1)
+)
+
+if (any(family_counts == 0)) {
+  stop(
+    "One or more expected supplementary feature families are absent: ",
+    paste(names(family_counts)[family_counts == 0], collapse = "; ")
+  )
+}
+
+supplementary_predictors <- unique(unlist(lapply(
+  feature_family_patterns,
+  function(pattern) grep(pattern, predictor_names, value = TRUE)
+)))
+
+feature_family_summary <- data.frame(
+  feature_set = c(names(family_counts), "Application and engineered application fields"),
+  predictors = c(
+    unname(family_counts),
+    length(setdiff(predictor_names, supplementary_predictors))
+  )
+)
+
+knitr::kable(
+  feature_family_summary,
+  caption = "Candidate predictors by source family"
+)
+```
+
+The family labels describe provenance, not guaranteed value. A later controlled comparison will test whether the supplementary history improves out-of-sample ROC-AUC over application-only predictors.
+
+## Validation design and leakage boundary
+
+Model exploration will use one shared set of stratified 3-fold resamples so candidate algorithms are compared on the same assessment applicants. ROC-AUC will be the selection metric; accuracy and other diagnostic measures can supplement it but will not replace it.
+
+The saved prepared tables were produced by a recipe fitted to the entire training population. That is appropriate for fitting a final selected model and scoring the test population, but it is **not** the correct input for cross-validation: medians, percentile caps, quantile bins, category levels, dummy encoding, and zero-variance decisions would already contain information from each assessment fold. Before candidate-model comparison, the modeling pipeline must make those learned steps part of each resample so they are estimated on the analysis fold only.
+
+The following validation contract will govern later sections:
+
+1. Create stratified 3-fold splits from the training outcome.
+2. Use the same folds for every candidate model and feature-set comparison.
+3. Estimate all learned preprocessing from each analysis fold only.
+4. Apply the fitted fold preprocessing unchanged to its assessment fold.
+5. Apply sampling methods such as SMOTE only to analysis-fold data, never to assessment data.
+6. Compare candidates on mean cross-validated ROC-AUC and retain fold-level results to show variability.
+7. Use the test population only after model selection; do not use it for tuning or model comparison.
+
+## Section 1 audit result
+
+```{r}
+#| label: section-1-result
+
+section_1_result <- data.frame(
+  audit = c(
+    "Applicant grain and target separation",
+    "Predictor manifest and train/test compatibility",
+    "Expected supplementary feature families",
+    "Modeling seed recorded",
+    "Cross-validation leakage boundary documented"
+  ),
+  result = rep("Passed", 5)
+)
+
+knitr::kable(
+  section_1_result,
+  caption = "Section 1 completion checks"
+)
+```
+
+Section 1 establishes a valid modeling population and a validation boundary consistent with the earlier project work. No model has been trained in this section.
+
+**Takeaway from Section 1:** The applicant grain, target, and leakage boundary are valid, so later comparisons can be interpreted as model differences rather than data-alignment errors.
+
+# Section 2: Reusable modeling functions and resamples
+
+**Purpose**
+
+Candidate models must be compared using the same outcome definition, folds, and metrics. This section moves those rules into reusable functions rather than repeating slightly different code for each algorithm. The functions live in `R/modeling_functions.R`, while this notebook explains and verifies their use.
+
+This section creates resamples but does not fit a model. Fold-safe feature preprocessing remains a requirement for the next section.
+
+## Modeling infrastructure
+
+```{r}
+#| label: load-modeling-functions
+
+infrastructure_packages <- c("dplyr", "rlang", "rsample", "yardstick")
+missing_infrastructure_packages <- infrastructure_packages[
+  !vapply(
+    infrastructure_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_infrastructure_packages) > 0) {
+  stop(
+    "Install the following modeling package(s): ",
+    paste(missing_infrastructure_packages, collapse = ", ")
+  )
+}
+
+source(file.path(project_root, "R", "modeling_functions.R"))
+
+artifacts <- load_modeling_artifacts(processed_dir)
+
+# Keep only the approved modeling roles. Audit and quality-check fields remain
+# in train_prepared for later subgroup analysis, not in this model-development object.
+model_data <- artifacts$train[
+  c("SK_ID_CURR", "TARGET", artifacts$predictors)
+]
+model_data <- prepare_model_outcome(model_data)
+```
+
+`prepare_model_outcome()` converts the numeric outcome into a labeled factor whose first level is `payment_difficulty`. This makes the event definition explicit and consistent with `yardstick` defaults. It avoids accidentally reporting discrimination for the majority class.
+
+## Stratified three-fold cross-validation
+
+```{r}
+#| label: create-validated-folds
+
+cv_folds <- create_stratified_folds(
+  model_data,
+  outcome_col = "TARGET",
+  v = 3L,
+  seed = model_seed
+)
+
+validate_cv_folds(
+  cv_folds,
+  id_col = "SK_ID_CURR",
+  outcome_col = "TARGET",
+  expected_v = 3L
+)
+
+fold_summary <- summarize_cv_folds(cv_folds)
+
+knitr::kable(
+  fold_summary,
+  digits = 4,
+  caption = "Stratified cross-validation fold sizes and payment-difficulty rates",
+  format.args = list(big.mark = ",")
+)
+```
+
+Every applicant appears in exactly one assessment fold and never appears in both the analysis and assessment portions of the same fold. Stratification keeps the payment-difficulty rate close to the full training rate in each portion.
+
+The resample object retains the approved predictor columns, but it does not make the globally prepared values safe for model fitting. In the next section, each model workflow must estimate learned preprocessing independently within each analysis fold before it scores the corresponding assessment fold.
+
+## Common evaluation metrics
+
+```{r}
+#| label: define-metrics
+
+comparison_metrics <- model_metric_set()
+
+metric_contract <- data.frame(
+  metric = c("ROC-AUC", "Accuracy"),
+  role = c("Primary model-comparison metric", "Secondary benchmark diagnostic"),
+  reason = c(
+    "Evaluates ranking across thresholds and is less misleading under imbalance",
+    "Required for the simple benchmark but sensitive to the majority class"
+  )
+)
+
+knitr::kable(
+  metric_contract,
+  caption = "Metrics used consistently across candidate models"
+)
+```
+
+The reusable metric set will calculate ROC-AUC and accuracy from the same assessment predictions. Candidate selection will use ROC-AUC; high accuracy alone will not qualify a model as useful.
+
+## Infrastructure tests
+
+The checks below test determinism, fold separation, event ordering, metric summarization, and the guard against comparing candidates evaluated on different folds. Expected errors are captured silently so the rendered notebook remains concise.
+
+```{r}
+#| label: test-modeling-infrastructure
+
+cv_folds_repeat <- create_stratified_folds(
+  model_data,
+  outcome_col = "TARGET",
+  v = 3L,
+  seed = model_seed
+)
+
+assessment_ids <- function(folds) {
+  lapply(
+    folds$splits,
+    function(split) rsample::assessment(split)$SK_ID_CURR
+  )
+}
+
+example_metrics <- data.frame(
+  .metric = rep(c("roc_auc", "accuracy"), each = 3),
+  .estimate = c(0.70, 0.71, 0.69, 0.92, 0.91, 0.92)
+)
+example_summary <- summarize_resample_metrics(example_metrics)
+
+valid_result <- data.frame(id = cv_folds$id)
+invalid_result <- data.frame(id = cv_folds$id[-1])
+
+invalid_resample_guard <- inherits(
+  try(
+    assert_common_resamples(
+      list(invalid_candidate = invalid_result),
+      expected_ids = cv_folds$id
+    ),
+    silent = TRUE
+  ),
+  "try-error"
+)
+
+infrastructure_checks <- c(
+  "Same seed reproduces assessment membership" = identical(
+    assessment_ids(cv_folds),
+    assessment_ids(cv_folds_repeat)
+  ),
+  "Payment difficulty is the event level" = identical(
+    levels(model_data$TARGET)[1],
+    payment_difficulty_level
+  ),
+  "Three folds are present" = nrow(cv_folds) == 3L,
+  "Metric summary returns both metrics" = setequal(
+    example_summary$.metric,
+    c("roc_auc", "accuracy")
+  ),
+  "Matching resample IDs pass" = isTRUE(
+    assert_common_resamples(
+      list(example_candidate = valid_result),
+      expected_ids = cv_folds$id
+    )
+  ),
+  "Mismatched resample IDs are rejected" = invalid_resample_guard
+)
+
+if (!all(infrastructure_checks)) {
+  stop(
+    "Section 2 infrastructure test(s) failed: ",
+    paste(names(infrastructure_checks)[!infrastructure_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  data.frame(
+    test = names(infrastructure_checks),
+    result = ifelse(infrastructure_checks, "Passed", "Failed")
+  ),
+  caption = "Reusable modeling infrastructure tests"
+)
+```
+
+## Section 2 result
+
+Section 2 establishes one reproducible set of stratified 3-fold resamples, an explicit positive outcome, a shared metric definition, and safeguards against incompatible model comparisons. All infrastructure tests must pass before model fitting begins. No benchmark or candidate model has been trained in this section.
+
+**Takeaway from Section 2:** Every candidate will be judged on the same applicants and metric definitions, making the comparisons directly comparable.
+
+# Section 3: Fold-safe feature engineering and preprocessing
+
+**Purpose**
+
+Data preparation created two new modeling-base artifacts at the applicant grain. They contain fixed, decision-time-safe cleaning, application feature engineering, and supplementary aggregation, but they have not undergone any data-learned preprocessing. They are the correct inputs for cross-validation because each analysis fold can learn its own caps, bins, medians, and category levels.
+
+The globally prepared tables from Section 1 remain appropriate for a final model fitted to all training rows. They are not used to estimate cross-validated performance.
+
+## Modeling-base validation
+
+```{r}
+#| label: load-modeling-bases
+
+source(file.path(project_root, "R", "modeling_recipes.R"))
+
+base_paths <- file.path(
+  processed_dir,
+  c("train_modeling_base.rds", "test_modeling_base.rds")
+)
+
+if (!all(file.exists(base_paths))) {
+  stop(
+    "The pre-recipe modeling-base files are missing. Rerun the data-preparation notebook."
+  )
+}
+
+train_modeling_base <- readRDS(base_paths[1])
+test_modeling_base <- readRDS(base_paths[2])
+
+base_checks <- c(
+  "Training applicant grain changed" =
+    identical(train_modeling_base$SK_ID_CURR, train_prepared$SK_ID_CURR),
+  "Test applicant grain changed" =
+    identical(test_modeling_base$SK_ID_CURR, test_prepared$SK_ID_CURR),
+  "Training target changed" =
+    identical(train_modeling_base$TARGET, train_prepared$TARGET),
+  "TARGET appears in the scoring base" =
+    !"TARGET" %in% names(test_modeling_base),
+  "Training base IDs are duplicated" =
+    !anyDuplicated(train_modeling_base$SK_ID_CURR),
+  "Test base IDs are duplicated" =
+    !anyDuplicated(test_modeling_base$SK_ID_CURR)
+)
+
+if (!all(base_checks)) {
+  stop(
+    "Modeling-base validation failed: ",
+    paste(names(base_checks)[!base_checks], collapse = "; ")
+  )
+}
+
+base_summary <- data.frame(
+  population = c("Training", "Test"),
+  applicants = c(nrow(train_modeling_base), nrow(test_modeling_base)),
+  source_columns = c(ncol(train_modeling_base), ncol(test_modeling_base)),
+  learned_preprocessing_applied = "No"
+)
+
+knitr::kable(
+  base_summary,
+  caption = "Pre-recipe modeling-base artifacts",
+  format.args = list(big.mark = ",")
+)
+```
+
+The base tables match the applicant order and outcome created during data preparation. Their transformations are fixed rules: they do not estimate a population median, percentile, bin boundary, or category vocabulary.
+
+## Reproducible feature-set manifests
+
+The application-only feature set provides the controlled comparison required to measure the incremental value of historical data. The full feature set adds bureau, previous-application, installment, POS/CASH, credit-card coverage, unmatched-history, and cross-source coverage fields.
+
+```{r}
+#| label: feature-set-manifests
+
+feature_manifests <- build_feature_manifests(train_modeling_base)
+
+manifest_checks <- c(
+  "Application manifest is empty" = length(feature_manifests$application) > 0,
+  "Supplementary manifest is empty" = length(feature_manifests$supplementary) > 0,
+  "Feature sets overlap incorrectly" = length(intersect(
+    feature_manifests$application,
+    feature_manifests$supplementary
+  )) == 0,
+  "Full manifest is not the union" = setequal(
+    feature_manifests$full,
+    c(feature_manifests$application, feature_manifests$supplementary)
+  ),
+  "ID entered a feature manifest" =
+    !"SK_ID_CURR" %in% feature_manifests$full,
+  "TARGET entered a feature manifest" =
+    !"TARGET" %in% feature_manifests$full,
+  "Audit field entered a feature manifest" = !any(
+    feature_manifests$audit %in% feature_manifests$full
+  )
+)
+
+if (!all(manifest_checks)) {
+  stop(
+    "Feature-manifest validation failed: ",
+    paste(names(manifest_checks)[!manifest_checks], collapse = "; ")
+  )
+}
+
+manifest_summary <- data.frame(
+  feature_group = c(
+    "Application and engineered application fields",
+    "Supplementary history fields",
+    "Full candidate set",
+    "Audit-only fields",
+    "Quality-check fields"
+  ),
+  source_fields = c(
+    length(feature_manifests$application),
+    length(feature_manifests$supplementary),
+    length(feature_manifests$full),
+    length(feature_manifests$audit),
+    length(feature_manifests$quality_check)
+  )
+)
+
+knitr::kable(
+  manifest_summary,
+  caption = "Pre-recipe fields by approved modeling role"
+)
+```
+
+These counts refer to source fields before dummy encoding and added capped or log-transformed copies. The final number of model columns is learned independently within each fold.
+
+## Preprocessing design
+
+`build_model_recipe()` returns an untrained recipe for either approved feature set. The recipe preserves the decisions from the EDA and data-preparation phases:
+
+1. The applicant ID, outcome, audit fields, and quality checks receive non-predictor roles.
+2. The 1st and 99th percentile caps are learned for the four primary amount fields while the raw values are retained.
+3. `log1p` amount features and a separately binned financing-to-goods feature are created.
+4. Missingness indicators are created before numeric median imputation for the benchmark and comparison recipes. The selected final XGBoost model replaces this step with native missing-value split routing after the Section 5 ablation.
+5. Unseen categories and missing categories receive different levels.
+6. Nominal predictors are dummy encoded.
+7. Revolving-loan interactions are created for the three affordability ratios.
+8. Zero-variance predictors are removed, except reserved `OTHER_UNSEEN` columns.
+
+No class-imbalance sampling is included. Sampling belongs to a later controlled experiment and must occur only within analysis folds.
+
+```{r}
+#| label: define-fold-safe-recipes
+
+train_modeling_base <- prepare_model_outcome(train_modeling_base)
+
+application_recipe <- build_model_recipe(
+  train_modeling_base,
+  feature_set = "application"
+)
+full_history_recipe <- build_model_recipe(
+  train_modeling_base,
+  feature_set = "full"
+)
+
+recipe_summary <- data.frame(
+  recipe = c("Application only", "Application plus supplementary history"),
+  source_predictors = c(
+    length(feature_manifests$application),
+    length(feature_manifests$full)
+  ),
+  learned_now = "No; parameters are estimated during prep() within a resample"
+)
+
+knitr::kable(
+  recipe_summary,
+  caption = "Reusable untrained preprocessing recipes"
+)
+```
+
+The recipe definitions can be placed directly in later tidymodels workflows. During resampling, `prep()` is run separately for each analysis fold; the resulting fold recipe is then applied unchanged to its assessment fold.
+
+## Real-fold preprocessing test
+
+The first approved fold provides a full-scale test. Applicant IDs from Section 2 select the same fold membership from the pre-recipe table, ensuring that the modeling data and the resampling plan remain aligned.
+
+```{r}
+#| label: test-real-fold-preprocessing
+
+fold_1_analysis_ids <- rsample::analysis(cv_folds$splits[[1]])$SK_ID_CURR
+fold_1_assessment_ids <- rsample::assessment(cv_folds$splits[[1]])$SK_ID_CURR
+
+fold_1_analysis <- train_modeling_base[
+  match(fold_1_analysis_ids, train_modeling_base$SK_ID_CURR),
+]
+fold_1_assessment <- train_modeling_base[
+  match(fold_1_assessment_ids, train_modeling_base$SK_ID_CURR),
+]
+
+if (anyNA(fold_1_analysis$SK_ID_CURR) || anyNA(fold_1_assessment$SK_ID_CURR)) {
+  stop("Fold IDs did not align with the modeling-base table.")
+}
+
+# Rebuild on the analysis data so this standalone test makes the fitting boundary visible.
+fold_1_recipe <- build_model_recipe(fold_1_analysis, feature_set = "full")
+fold_1_prepped <- recipes::prep(
+  fold_1_recipe,
+  training = fold_1_analysis,
+  retain = TRUE
+)
+fold_1_analysis_baked <- recipes::juice(fold_1_prepped)
+fold_1_assessment_baked <- recipes::bake(
+  fold_1_prepped,
+  new_data = fold_1_assessment
+)
+
+validate_baked_fold(
+  fold_1_prepped,
+  fold_1_analysis_baked,
+  fold_1_assessment_baked
+)
+
+fold_1_roles <- summary(fold_1_prepped)
+fold_1_predictors <- fold_1_roles$variable[
+  fold_1_roles$role == "predictor"
+]
+
+fold_bake_summary <- data.frame(
+  population = c("Analysis", "Assessment"),
+  applicants = c(nrow(fold_1_analysis_baked), nrow(fold_1_assessment_baked)),
+  baked_columns = c(ncol(fold_1_analysis_baked), ncol(fold_1_assessment_baked)),
+  predictors = length(fold_1_predictors),
+  missing_predictor_values = c(
+    sum(is.na(fold_1_analysis_baked[fold_1_predictors])),
+    sum(is.na(fold_1_assessment_baked[fold_1_predictors]))
+  )
+)
+
+knitr::kable(
+  fold_bake_summary,
+  caption = "Fold 1 preprocessing validation",
+  format.args = list(big.mark = ",")
+)
+```
+
+Analysis and assessment applicants have identical baked columns, and all model predictors are numeric and complete. The applicant ID and audit fields remain available for alignment and later subgroup review without entering the predictor matrix.
+
+## Evidence that parameters are analysis-fold learned
+
+```{r}
+#| label: verify-fold-learned-parameters
+
+fold_caps <- recipes::tidy(fold_1_prepped, id = "cap_amounts")
+
+expected_fold_caps <- do.call(rbind, lapply(
+  fold_caps$terms,
+  function(field) {
+    values <- stats::quantile(
+      fold_1_analysis[[field]],
+      probs = c(0.01, 0.99),
+      na.rm = TRUE,
+      names = FALSE
+    )
+    data.frame(
+      terms = field,
+      expected_lower = values[1],
+      expected_upper = values[2]
+    )
+  }
+))
+
+cap_evidence <- merge(fold_caps, expected_fold_caps, by = "terms", sort = FALSE)
+cap_matches_analysis <- isTRUE(all.equal(
+  cap_evidence$lower_cap,
+  cap_evidence$expected_lower,
+  tolerance = 1e-10
+)) && isTRUE(all.equal(
+  cap_evidence$upper_cap,
+  cap_evidence$expected_upper,
+  tolerance = 1e-10
+))
+
+if (!cap_matches_analysis) {
+  stop("Stored caps do not match the analysis-fold quantiles.")
+}
+
+knitr::kable(
+  cap_evidence[
+    c("terms", "lower_cap", "upper_cap", "expected_lower", "expected_upper")
+  ],
+  digits = 2,
+  caption = "Stored caps compared with independently calculated Fold 1 analysis quantiles",
+  format.args = list(big.mark = ",")
+)
+```
+
+The stored values exactly match independent calculations from the analysis fold. The assessment rows were not supplied to `prep()` and therefore could not influence these parameters.
+
+## Novel-category and role tests
+
+```{r}
+#| label: test-novel-category-and-roles
+
+novel_case <- fold_1_assessment[1, , drop = FALSE]
+novel_case$NAME_INCOME_TYPE <- "SECTION3_TEST_UNSEEN"
+novel_case_baked <- recipes::bake(fold_1_prepped, new_data = novel_case)
+novel_dummy <- "NAME_INCOME_TYPE_OTHER_UNSEEN"
+
+section_3_checks <- c(
+  "Analysis/assessment schemas match" = identical(
+    names(fold_1_analysis_baked), names(fold_1_assessment_baked)
+  ),
+  "Analysis predictors are complete" =
+    !anyNA(fold_1_analysis_baked[fold_1_predictors]),
+  "Assessment predictors are complete" =
+    !anyNA(fold_1_assessment_baked[fold_1_predictors]),
+  "Applicant ID is excluded" = !"SK_ID_CURR" %in% fold_1_predictors,
+  "Outcome is excluded" = !"TARGET" %in% fold_1_predictors,
+  "Audit fields are excluded" = !any(
+    feature_manifests$audit %in% fold_1_predictors
+  ),
+  "Novel-category column is retained" = novel_dummy %in% names(novel_case_baked),
+  "Novel category maps explicitly" =
+    novel_dummy %in% names(novel_case_baked) && novel_case_baked[[novel_dummy]] == 1,
+  "Caps match analysis-fold estimates" = cap_matches_analysis
+)
+
+if (!all(section_3_checks)) {
+  stop(
+    "Section 3 test(s) failed: ",
+    paste(names(section_3_checks)[!section_3_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  data.frame(
+    test = names(section_3_checks),
+    result = ifelse(section_3_checks, "Passed", "Failed")
+  ),
+  caption = "Fold-safe preprocessing tests"
+)
+```
+
+## Section 3 result
+
+Section 3 establishes leak-resistant modeling inputs, two traceable feature sets, and reusable recipes whose learned parameters are estimated within analysis folds. The full-scale Fold 1 test confirms consistent schemas, complete numeric predictors, explicit handling of unseen categories, and exclusion of IDs and governance-audit fields. No model has been fitted.
+
+**Takeaway from Section 3:** The comparisons that follow are leak-resistant, so performance differences reflect the feature sets and models rather than preprocessing learned from assessment rows.
+
+# Section 4: Performance benchmarks
+
+**Purpose**
+
+The first benchmark represents the result of making no meaningful risk distinction: every applicant is assigned to the majority class. Its high accuracy shows the effect of the approximately 8% payment-difficulty rate, while its ROC-AUC establishes the no-discrimination reference of 0.50.
+
+A second benchmark uses a deliberately small application-only logistic regression. It tests whether a conventional, interpretable statistical model can rank risk before supplementary history, complex algorithms, imbalance adjustments, or tuning are introduced.
+
+**Connection:** With the leakage controls established in Sections 1–3, these benchmarks define the minimum performance that every later modeling choice must exceed.
+
+**Method**
+
+## Resample alignment on the modeling base
+
+The Section 2 folds were originally created on the globally prepared table to establish membership. The same seed, applicant order, and stratification are now used on the pre-recipe modeling base. The assertion below requires identical assessment applicants in every fold.
+
+```{r}
+#| label: align-modeling-base-folds
+
+# Recreate folds on the pre-recipe table, then prove applicant membership is unchanged.
+modeling_cv_folds <- create_stratified_folds(
+  train_modeling_base,
+  outcome_col = "TARGET",
+  v = 3L,
+  seed = model_seed
+)
+
+validate_cv_folds(
+  modeling_cv_folds,
+  id_col = "SK_ID_CURR",
+  outcome_col = "TARGET",
+  expected_v = 3L
+)
+
+same_fold_membership <- identical(
+  lapply(cv_folds$splits, function(split) {
+    rsample::assessment(split)$SK_ID_CURR
+  }),
+  lapply(modeling_cv_folds$splits, function(split) {
+    rsample::assessment(split)$SK_ID_CURR
+  })
+)
+
+if (!same_fold_membership) {
+  stop("Modeling-base folds do not match the approved Section 2 membership.")
+}
+
+knitr::kable(
+  data.frame(
+    validation = c(
+      "Three stratified folds",
+      "Same assessment applicants as Section 2",
+      "Pre-recipe modeling base used"
+    ),
+    result = "Passed"
+  ),
+  caption = "Benchmark resample alignment"
+)
+```
+
+## Majority-class benchmark
+
+Within each fold, the benchmark assigns every assessment applicant to `no_payment_difficulty`. Its probability estimate for payment difficulty is the prevalence observed in that fold's analysis portion. Because this probability is constant within a fold, the model cannot rank applicants and its ROC-AUC is 0.50.
+
+```{r}
+#| label: majority-benchmark
+
+majority_metrics <- evaluate_majority_benchmark(modeling_cv_folds) |>
+  dplyr::mutate(model = "Majority class", .before = 1)
+
+knitr::kable(
+  majority_metrics[c("model", "id", ".metric", ".estimate")],
+  digits = 4,
+  caption = "Fold-level majority-class benchmark performance"
+)
+```
+
+Accuracy remains close to 92% even though the benchmark has no discrimination. This is why candidate models will not be selected on accuracy.
+
+## Simple application-only logistic benchmark
+
+The logistic benchmark uses twelve source predictors chosen from the EDA and industry context:
+
+| Predictor group | Fields | Rationale |
+|---|---|---|
+| External risk scores | `EXT_SOURCE_1`, `EXT_SOURCE_2`, `EXT_SOURCE_3` | Existing application-time risk information; useful for ranking but anonymized and subject to later explainability review |
+| Requested financing | Credit, annuity, income, and goods amounts | Loan size and reported repayment capacity |
+| Affordability proxies | Annuity-to-income, credit-to-income, and financing-to-goods | EDA-supported measures of financial burden |
+| Product | Contract type | The EDA found different risk structures by product |
+| Employment stability | Employment duration | A conventional repayment-capacity indicator |
+
+The recipe caps the four amount fields using analysis-fold percentiles, creates missingness indicators for the external scores, imputes numeric fields with analysis-fold medians, and dummy encodes contract type. It excludes historical supplementary tables, audit-only fields, class balancing, and hyperparameter tuning.
+
+```{r}
+#| label: simple-logistic-benchmark
+
+benchmark_recipe <- build_simple_logistic_recipe(train_modeling_base)
+
+benchmark_model <- parsnip::logistic_reg() |>
+  parsnip::set_engine("glm") |>
+  parsnip::set_mode("classification")
+
+benchmark_workflow <- workflows::workflow() |>
+  workflows::add_recipe(benchmark_recipe) |>
+  workflows::add_model(benchmark_model)
+
+logistic_resamples <- fit_resampled_workflow(
+  benchmark_workflow,
+  folds = modeling_cv_folds,
+  metrics = comparison_metrics,
+  seed = model_seed
+)
+
+logistic_notes <- tune::collect_notes(logistic_resamples)
+if (nrow(logistic_notes) > 0) {
+  stop(
+    "The simple logistic benchmark produced resampling notes; review before comparison."
+  )
+}
+
+logistic_metrics <- collect_fold_metrics(
+  logistic_resamples,
+  model_label = "Simple logistic"
+)
+
+knitr::kable(
+  logistic_metrics,
+  digits = 4,
+  caption = "Fold-level simple-logistic benchmark performance"
+)
+```
+
+**Results**
+
+## Benchmark comparison
+
+```{r}
+#| label: compare-benchmarks
+
+benchmark_fold_metrics <- dplyr::bind_rows(
+  majority_metrics[c("model", "id", ".metric", ".estimate")],
+  logistic_metrics
+)
+
+assert_common_resamples(
+  split(benchmark_fold_metrics, benchmark_fold_metrics$model),
+  expected_ids = modeling_cv_folds$id
+)
+
+benchmark_comparison <- benchmark_fold_metrics |>
+  dplyr::group_by(.data$model, .data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_dev = stats::sd(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    folds = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(.data$.metric, .data$model)
+
+majority_auc <- benchmark_comparison$mean[
+  benchmark_comparison$model == "Majority class" &
+    benchmark_comparison$.metric == "roc_auc"
+]
+logistic_auc <- benchmark_comparison$mean[
+  benchmark_comparison$model == "Simple logistic" &
+    benchmark_comparison$.metric == "roc_auc"
+]
+
+benchmark_checks <- c(
+  "Majority ROC-AUC equals 0.50" = isTRUE(all.equal(majority_auc, 0.5)),
+  "Simple logistic beats majority ROC-AUC" = logistic_auc > majority_auc,
+  "Both benchmarks use all three folds" = all(
+    benchmark_comparison$folds == 3L
+  ),
+  "Both benchmarks use approved resamples" = isTRUE(
+    assert_common_resamples(
+      split(benchmark_fold_metrics, benchmark_fold_metrics$model),
+      expected_ids = modeling_cv_folds$id
+    )
+  )
+)
+
+if (!all(benchmark_checks)) {
+  stop(
+    "Benchmark validation failed: ",
+    paste(names(benchmark_checks)[!benchmark_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  benchmark_comparison,
+  digits = 4,
+  caption = "Cross-validated benchmark comparison"
+)
+```
+
+The majority classifier is the formal no-skill benchmark: its high accuracy comes entirely from class imbalance, and its ROC-AUC is 0.50. The simple logistic model provides the more useful modeling benchmark because it must rank applicants using a small application-only feature set. Its improvement in cross-validated ROC-AUC demonstrates that the available application information contains out-of-sample ranking signal.
+
+**Implications**
+
+`r if (logistic_auc > majority_auc) sprintf("The simple logistic benchmark improves ROC-AUC from %.4f to %.4f, so later candidates must beat %.4f to add value beyond basic application information.", majority_auc, logistic_auc, logistic_auc) else "The simple logistic model did not beat the no-skill benchmark, so the application predictors would need to be reconsidered before more complex modeling."` The comparison remains threshold-neutral; no approval cutoff or business lift is inferred.
+
+**Takeaway from Section 4:** `r if (logistic_auc > majority_auc) "The data contain genuine ranking signal, and the simple logistic ROC-AUC is the meaningful benchmark for the candidate-model comparison." else "No reliable ranking signal has yet been demonstrated."`
+
+# Section 5: Candidate model comparison
+
+**Purpose**
+
+This section compares linear and nonlinear candidates using the same three folds, outcome definition, fold-safe preprocessing, and evaluation metrics. Settings are fixed in advance so the results describe broad modeling ideas rather than a hyperparameter search.
+
+The comparison separates two questions:
+
+1. Does the approved supplementary history improve a regularized logistic model beyond application information alone?
+2. Do nonlinear tree ensembles improve ranking beyond the linear candidates?
+
+No candidate uses class weighting, upsampling, downsampling, SMOTE, or tuned parameters in this section.
+
+**Connection:** The benchmark from Section 4 becomes the reference for testing whether richer features and nonlinear algorithms add out-of-sample ranking value.
+
+**Method**
+
+## Candidate specifications
+
+```{r}
+#| label: define-candidate-models
+
+candidate_packages <- c("glmnet", "ranger", "xgboost")
+missing_candidate_packages <- candidate_packages[
+  !vapply(candidate_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_candidate_packages)) {
+  stop(
+    "Install the following candidate-model package(s): ",
+    paste(missing_candidate_packages, collapse = ", ")
+  )
+}
+
+ridge_spec <- parsnip::logistic_reg(
+  penalty = 0.001,
+  mixture = 0
+) |>
+  parsnip::set_engine("glmnet") |>
+  parsnip::set_mode("classification")
+
+forest_spec <- parsnip::rand_forest(
+  mtry = 14,
+  trees = 300,
+  min_n = 10
+) |>
+  parsnip::set_engine(
+    "ranger",
+    probability = TRUE,
+    num.threads = resample_engine_threads,
+    seed = model_seed
+  ) |>
+  parsnip::set_mode("classification")
+
+xgboost_spec <- parsnip::boost_tree(
+  mtry = 100,
+  trees = 300,
+  min_n = 10,
+  tree_depth = 6,
+  learn_rate = 0.05,
+  loss_reduction = 0,
+  sample_size = 0.8
+) |>
+  parsnip::set_engine(
+    "xgboost",
+    nthread = resample_engine_threads,
+    verbosity = 0
+  ) |>
+  parsnip::set_mode("classification")
+
+candidate_settings <- data.frame(
+  candidate = c(
+    "Ridge logistic — application",
+    "Ridge logistic — full history",
+    "XGBoost — application",
+    "Random forest — full history",
+    "XGBoost — full history"
+  ),
+  feature_set = c("Application", "Full", "Application", "Full", "Full"),
+  fixed_settings = c(
+    "penalty = 0.001; mixture = 0",
+    "penalty = 0.001; mixture = 0",
+    paste(
+      "mtry = 100; trees = 300; depth = 6; learn rate = 0.05;",
+      "min_n = 10; row sample = 0.8"
+    ),
+    "mtry = 14; trees = 300; min_n = 10",
+    paste(
+      "mtry = 100; trees = 300; depth = 6; learn rate = 0.05;",
+      "min_n = 10; row sample = 0.8"
+    )
+  )
+)
+
+knitr::kable(
+  candidate_settings,
+  caption = "Untuned candidate-model specifications"
+)
+```
+
+The ridge models use the same fixed penalty so the feature-set comparison is controlled. The random forest and XGBoost settings are computationally moderate starting points, not claimed optima. Their purpose is to test whether nonlinear splits and interactions are promising enough to justify later tuning.
+
+## Three-fold candidate evaluation
+
+```{r}
+#| label: fit-candidate-models
+
+candidate_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  ridge = ridge_spec,
+  forest = forest_spec,
+  xgboost = xgboost_spec,
+  application_features = feature_manifests$application,
+  full_features = feature_manifests$full,
+  fold_ids = modeling_cv_folds$id
+))
+
+# The object hash prevents stale reuse when a model specification or feature set changes.
+candidate_runs <- cached_modeling_result("candidate_runs", list(
+  run_candidate_model(
+    model_label = "Ridge logistic — application",
+    model_spec = ridge_spec,
+    recipe = application_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "Ridge logistic — full history",
+    model_spec = ridge_spec,
+    recipe = full_history_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "XGBoost — application",
+    model_spec = xgboost_spec,
+    recipe = application_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "Random forest — full history",
+    model_spec = forest_spec,
+    recipe = full_history_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "XGBoost — full history",
+    model_spec = xgboost_spec,
+    recipe = full_history_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed,
+    retain_predictions = TRUE
+  )
+), spec_signature = candidate_spec_signature)
+
+candidate_outputs <- combine_candidate_runs(candidate_runs)
+candidate_fold_metrics <- candidate_outputs$fold_metrics
+candidate_runtime <- candidate_outputs$runtime
+
+assert_common_resamples(
+  split(candidate_fold_metrics, candidate_fold_metrics$model),
+  expected_ids = modeling_cv_folds$id
+)
+```
+
+Each workflow refits its recipe inside each analysis fold. The assessment fold is used only after preprocessing and model fitting are complete. Resamples run sequentially by default with four engine threads per XGBoost or ranger fit. If `MODELING_WORKERS` enables parallel folds, each fit uses one engine thread to avoid nested oversubscription.
+
+**Results**
+
+## Fold-level results
+
+```{r}
+#| label: candidate-fold-results
+
+candidate_auc_by_fold <- candidate_fold_metrics |>
+  dplyr::filter(.data$.metric == "roc_auc") |>
+  dplyr::arrange(.data$model, .data$id)
+
+knitr::kable(
+  candidate_auc_by_fold,
+  digits = 4,
+  caption = "Candidate ROC-AUC by assessment fold"
+)
+
+candidate_notes <- dplyr::bind_rows(lapply(candidate_runs, function(run) {
+  if (!nrow(run$notes)) return(NULL)
+  data.frame(model = run$model, run$notes, check.names = FALSE)
+}))
+
+if (nrow(candidate_notes)) {
+  knitr::kable(
+    candidate_notes,
+    caption = "Non-error engine notes produced during candidate fitting"
+  )
+}
+```
+
+Fold-level results are retained so a candidate is not selected from an average that hides an unstable assessment fold. Any fitting error would have stopped this section before comparison.
+
+## Cross-validated comparison
+
+```{r}
+#| label: compare-candidate-models
+
+all_model_metrics <- dplyr::bind_rows(
+  benchmark_fold_metrics,
+  candidate_fold_metrics
+)
+
+model_comparison <- all_model_metrics |>
+  dplyr::group_by(.data$model, .data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_dev = stats::sd(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    folds = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(.data$.metric, dplyr::desc(.data$mean))
+
+auc_comparison <- model_comparison |>
+  dplyr::filter(.data$.metric == "roc_auc") |>
+  dplyr::arrange(dplyr::desc(.data$mean))
+
+knitr::kable(
+  auc_comparison,
+  digits = 4,
+  caption = "Cross-validated ROC-AUC comparison"
+)
+
+knitr::kable(
+  candidate_runtime,
+  digits = 1,
+  caption = "Elapsed time for three-fold candidate evaluation"
+)
+```
+
+Runtime is reported as an operational consideration, not a performance metric. It depends on the available computer and should be interpreted comparatively within this run.
+
+## Supplementary-data and algorithm findings
+
+```{r}
+#| label: candidate-findings
+
+auc_lookup <- stats::setNames(auc_comparison$mean, auc_comparison$model)
+
+supplementary_auc_change <- unname(
+  auc_lookup["Ridge logistic — full history"] -
+    auc_lookup["Ridge logistic — application"]
+)
+xgboost_supplementary_auc_change <- unname(
+  auc_lookup["XGBoost — full history"] -
+    auc_lookup["XGBoost — application"]
+)
+best_candidate <- candidate_auc_by_fold |>
+  dplyr::group_by(.data$model) |>
+  dplyr::summarise(mean_auc = mean(.data$.estimate), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(.data$mean_auc)) |>
+  dplyr::slice(1)
+
+candidate_checks <- c(
+  "Every candidate has three ROC-AUC estimates" = all(
+    table(candidate_auc_by_fold$model) == 3L
+  ),
+  "Every candidate beats the majority benchmark" = all(
+    candidate_auc_by_fold |>
+      dplyr::group_by(.data$model) |>
+      dplyr::summarise(mean_auc = mean(.data$.estimate), .groups = "drop") |>
+      dplyr::pull(.data$mean_auc) > majority_auc
+  ),
+  "At least one candidate beats the simple logistic benchmark" =
+    best_candidate$mean_auc > logistic_auc,
+  "No candidate fit produced an error note" = all(vapply(
+    candidate_runs,
+    function(run) !nrow(run$notes) || !any(run$notes$type == "error"),
+    logical(1)
+  ))
+)
+
+if (!all(candidate_checks)) {
+  stop(
+    "Candidate comparison validation failed: ",
+    paste(names(candidate_checks)[!candidate_checks], collapse = "; ")
+  )
+}
+
+finding_summary <- data.frame(
+  question = c(
+    "Change from supplementary history in ridge logistic",
+    "Change from supplementary history in XGBoost",
+    "Best untuned candidate",
+    "Best untuned mean ROC-AUC",
+    "Project target reached"
+  ),
+  result = c(
+    sprintf("%+.4f ROC-AUC", supplementary_auc_change),
+    sprintf("%+.4f ROC-AUC", xgboost_supplementary_auc_change),
+    best_candidate$model,
+    sprintf("%.4f", best_candidate$mean_auc),
+    ifelse(best_candidate$mean_auc >= 0.79, "Yes", "No")
+  )
+)
+
+knitr::kable(
+  finding_summary,
+  caption = "Candidate-model findings"
+)
+```
+
+The controlled ridge and XGBoost comparisons estimate the incremental value of supplementary history under the same algorithm settings. The remaining tree comparison shows whether a different nonlinear ensemble adds value. These are predictive associations, not causal effects or evidence that every included field is suitable for a final lending policy.
+
+Random forest was evaluated only with the full-history feature set. `r if (unname(auc_lookup["Random forest — full history"]) < max(unname(auc_lookup[c("Ridge logistic — full history", "XGBoost — full history")]))) "Because full-history random forest already trailed the stronger full-history ridge and XGBoost candidates, an additional application-only forest run was not prioritized." else "Because full-history random forest remained competitive, an application-only forest comparison should be considered in a later expansion."`
+
+## Missing-data handling experiment
+
+The primary recipe adds missingness indicators for heavily missing credit-risk fields and imputes numeric predictors with analysis-fold medians. XGBoost can instead retain numeric missing values and learn a default branch direction at each split. The experiment below removes only the missing-indicator and median-imputation steps, then compares both approaches using the same full-history XGBoost specification and assessment folds.
+
+```{r}
+#| label: compare-xgboost-missing-strategies
+
+# Clone the validated recipe, then remove only the two explicit numeric-missing steps.
+native_missing_recipe <- full_history_recipe
+native_missing_recipe$steps <- Filter(
+  function(step) {
+    !inherits(step, "step_indicate_na") &&
+      !inherits(step, "step_impute_median")
+  },
+  native_missing_recipe$steps
+)
+
+removed_missing_steps <- setdiff(
+  vapply(full_history_recipe$steps, function(step) class(step)[1], character(1)),
+  vapply(native_missing_recipe$steps, function(step) class(step)[1], character(1))
+)
+stopifnot(
+  "Native-missing recipe must remove the indicator and median-imputation steps" =
+    setequal(removed_missing_steps, c("step_indicate_na", "step_impute_median"))
+)
+
+missing_strategy_signature <- digest::digest(list(
+  seed = model_seed,
+  model = xgboost_spec,
+  retain_predictions = TRUE,
+  removed_steps = sort(removed_missing_steps),
+  features = feature_manifests$full,
+  fold_ids = modeling_cv_folds$id
+))
+
+# Cache this additional three-fold experiment independently from the main candidates.
+native_missing_run <- cached_modeling_result(
+  "xgboost_native_missing",
+  run_candidate_model(
+    model_label = "XGBoost — full history, native missing",
+    model_spec = xgboost_spec,
+    recipe = native_missing_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed,
+    retain_predictions = TRUE
+  ),
+  spec_signature = missing_strategy_signature
+)
+
+native_missing_summary <- native_missing_run$metrics |>
+  dplyr::group_by(.data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    .groups = "drop"
+  )
+native_missing_auc <- native_missing_summary$mean[
+  native_missing_summary$.metric == "roc_auc"
+]
+native_missing_auc_se <- native_missing_summary$std_error[
+  native_missing_summary$.metric == "roc_auc"
+]
+imputed_xgboost_auc <- unname(auc_lookup["XGBoost — full history"])
+missing_strategy_change <- native_missing_auc - imputed_xgboost_auc
+
+missing_strategy_comparison <- data.frame(
+  strategy = c(
+    "Median imputation plus missingness indicators",
+    "Native XGBoost missing-value routing"
+  ),
+  mean_roc_auc = c(imputed_xgboost_auc, native_missing_auc),
+  std_error = c(
+    auc_comparison$std_error[
+      auc_comparison$model == "XGBoost — full history"
+    ],
+    native_missing_auc_se
+  ),
+  elapsed_seconds = c(
+    candidate_runtime$elapsed_seconds[
+      candidate_runtime$model == "XGBoost — full history"
+    ],
+    native_missing_run$elapsed_seconds
+  )
+)
+
+knitr::kable(
+  missing_strategy_comparison,
+  digits = 4,
+  caption = "Full-history XGBoost missing-data experiment"
+)
+```
+
+`r if (missing_strategy_change > 0) sprintf("Native missing-value routing improves mean ROC-AUC by %+.4f and should be considered for final selection.", missing_strategy_change) else sprintf("Median imputation plus missingness indicators remains stronger by %.4f ROC-AUC, so the established recipe is retained.", abs(missing_strategy_change))`
+
+**Implications**
+
+`r if (best_candidate$mean_auc > logistic_auc) sprintf("The best untuned candidate, %s, improves mean ROC-AUC from %.4f to %.4f; supplementary history changes XGBoost ROC-AUC by %+.4f.", best_candidate$model, logistic_auc, best_candidate$mean_auc, xgboost_supplementary_auc_change) else sprintf("No untuned candidate improves on the simple logistic ROC-AUC of %.4f.", logistic_auc)` The result narrows the candidates for imbalance testing but does not establish an approval threshold.
+
+**Takeaway from Section 5:** `r if (native_missing_auc > imputed_xgboost_auc) "Native-missing full-history XGBoost is the strongest untuned modeling direction." else if (identical(best_candidate$model, "XGBoost — full history")) "Imputed full-history XGBoost is the strongest untuned modeling direction." else sprintf("%s is the strongest untuned modeling direction.", best_candidate$model)` The imbalance and tuning experiments below retain the median-imputation recipe as their common controlled baseline; the native-missing alternative is carried separately to final selection in Section 9.
+
+# Section 6: Class-imbalance strategies
+
+**Purpose**
+
+Only about 8% of training applicants experienced payment difficulty. Section 5 used the observed distribution without adjustment. This section holds the median-imputation full-history XGBoost baseline fixed and changes only how the analysis-fold classes influence fitting. The imbalance and later tuning experiments were not repeated with native missing-value routing; that alternative remains eligible and is carried directly to final selection in Section 9.
+
+Four strategies are compared:
+
+1. **Unadjusted:** retain the observed analysis-fold distribution.
+2. **Class weighted:** retain every row but increase the XGBoost loss weight for the event class by 11.4, the approximate negative-to-positive ratio implied by the EDA baseline.
+3. **Downsampled:** randomly retain equal counts of majority and minority analysis rows.
+4. **SMOTE:** create synthetic minority rows until the minority count is half the majority count.
+
+Sampling is never applied to assessment folds. The model specification and assessment applicants remain unchanged, so differences are attributable to the imbalance strategy rather than tuning or a different validation sample.
+
+**Connection:** The strongest untuned Section 5 model is held fixed here so only the treatment of class imbalance changes.
+
+**Method**
+
+## Sampling recipes
+
+```{r}
+#| label: define-imbalance-recipes
+
+if (!requireNamespace("themis", quietly = TRUE)) {
+  stop("Install package 'themis' before running the imbalance experiments.")
+}
+
+downsample_recipe <- add_imbalance_strategy(
+  full_history_recipe,
+  strategy = "downsample",
+  seed = model_seed,
+  under_ratio = 1
+)
+
+smote_recipe <- add_imbalance_strategy(
+  full_history_recipe,
+  strategy = "smote",
+  seed = model_seed,
+  over_ratio = 0.5
+)
+
+imbalance_design <- data.frame(
+  strategy = c("Unadjusted", "Class weighted", "Downsampled", "SMOTE"),
+  analysis_fold_change = c(
+    "None",
+    "Event loss weight = 11.4; all rows retained",
+    "Majority randomly reduced to the minority count",
+    "Synthetic minority rows added to minority/majority = 0.5"
+  ),
+  assessment_fold_change = "None"
+)
+
+knitr::kable(
+  imbalance_design,
+  caption = "Controlled class-imbalance experiment"
+)
+```
+
+The 11.4 weight is declared from the approximately 8% project baseline rather than recalculated from assessment outcomes. Sampling steps use `skip = TRUE`, the recipes convention that applies them while preparing analysis data but skips them when new assessment or scoring data are baked.
+
+## Sampling-boundary test
+
+```{r}
+#| label: test-sampling-boundary
+
+sampling_test_recipes <- list(
+  Downsampled = build_model_recipe(fold_1_analysis, feature_set = "full") |>
+    add_imbalance_strategy(
+      strategy = "downsample",
+      seed = model_seed,
+      under_ratio = 1
+    ),
+  SMOTE = build_model_recipe(fold_1_analysis, feature_set = "full") |>
+    add_imbalance_strategy(
+      strategy = "smote",
+      seed = model_seed,
+      over_ratio = 0.5
+    )
+)
+
+sampling_test_results <- lapply(names(sampling_test_recipes), function(strategy) {
+  trained <- recipes::prep(
+    sampling_test_recipes[[strategy]],
+    training = fold_1_analysis,
+    retain = TRUE
+  )
+  sampled_analysis <- recipes::juice(trained)
+  untouched_assessment <- recipes::bake(trained, new_data = fold_1_assessment)
+
+  analysis_counts <- table(sampled_analysis$TARGET)
+  assessment_counts <- table(untouched_assessment$TARGET)
+
+  data.frame(
+    strategy = strategy,
+    original_analysis_rows = nrow(fold_1_analysis),
+    sampled_analysis_rows = nrow(sampled_analysis),
+    sampled_events = unname(analysis_counts[payment_difficulty_level]),
+    sampled_non_events = unname(analysis_counts[no_payment_difficulty_level]),
+    assessment_rows_before = nrow(fold_1_assessment),
+    assessment_rows_after = nrow(untouched_assessment),
+    assessment_distribution_unchanged = identical(
+      table(fold_1_assessment$TARGET),
+      assessment_counts
+    )
+  )
+})
+
+sampling_test_summary <- dplyr::bind_rows(sampling_test_results)
+
+if (!all(
+  sampling_test_summary$assessment_rows_before ==
+    sampling_test_summary$assessment_rows_after &
+    sampling_test_summary$assessment_distribution_unchanged
+)) {
+  stop("A sampling strategy changed the assessment fold.")
+}
+
+knitr::kable(
+  sampling_test_summary,
+  caption = "Fold 1 sampling and assessment-boundary validation",
+  format.args = list(big.mark = ",")
+)
+```
+
+This executed test proves that sampling changes only the analysis data supplied to the model. The natural event rate and applicant count are preserved in assessment, so performance is measured on the original population distribution.
+
+## Adjusted XGBoost specifications
+
+```{r}
+#| label: define-imbalance-models
+
+weighted_xgboost_spec <- parsnip::boost_tree(
+  mtry = 100,
+  trees = 300,
+  min_n = 10,
+  tree_depth = 6,
+  learn_rate = 0.05,
+  loss_reduction = 0,
+  sample_size = 0.8
+) |>
+  parsnip::set_engine(
+    "xgboost",
+    nthread = resample_engine_threads,
+    verbosity = 0,
+    scale_pos_weight = 11.4
+  ) |>
+  parsnip::set_mode("classification")
+
+imbalance_specs <- data.frame(
+  strategy = c("Class weighted", "Downsampled", "SMOTE"),
+  model = "Same 300-tree XGBoost structure as Section 5",
+  changed_component = c(
+    "scale_pos_weight = 11.4",
+    "analysis-fold recipe only",
+    "analysis-fold recipe only"
+  )
+)
+
+knitr::kable(
+  imbalance_specs,
+  caption = "Adjusted candidates relative to unadjusted XGBoost"
+)
+```
+
+## Three-fold imbalance comparison
+
+```{r}
+#| label: fit-imbalance-strategies
+
+downsample_step <- Filter(
+  function(step) inherits(step, "step_downsample"),
+  downsample_recipe$steps
+)[[1]]
+smote_step <- Filter(
+  function(step) inherits(step, "step_smote"),
+  smote_recipe$steps
+)[[1]]
+imbalance_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  unadjusted = xgboost_spec,
+  weighted = weighted_xgboost_spec,
+  downsample = downsample_step[c(
+    "under_ratio", "ratio", "replacement", "skip", "seed"
+  )],
+  smote = smote_step[c(
+    "over_ratio", "neighbors", "distance", "indicator_column", "skip", "seed"
+  )],
+  fold_ids = modeling_cv_folds$id
+))
+
+# Each sampling strategy is fitted on the same folds; sampling occurs inside recipes.
+imbalance_runs <- cached_modeling_result("imbalance_runs", list(
+  run_candidate_model(
+    model_label = "XGBoost — class weighted",
+    model_spec = weighted_xgboost_spec,
+    recipe = full_history_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "XGBoost — downsampled",
+    model_spec = xgboost_spec,
+    recipe = downsample_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  ),
+  run_candidate_model(
+    model_label = "XGBoost — SMOTE",
+    model_spec = xgboost_spec,
+    recipe = smote_recipe,
+    folds = modeling_cv_folds,
+    metrics = comparison_metrics,
+    seed = model_seed
+  )
+), spec_signature = imbalance_spec_signature)
+
+imbalance_outputs <- combine_candidate_runs(imbalance_runs)
+adjusted_imbalance_metrics <- imbalance_outputs$fold_metrics
+adjusted_imbalance_runtime <- imbalance_outputs$runtime
+
+unadjusted_xgboost_metrics <- candidate_fold_metrics |>
+  dplyr::filter(.data$model == "XGBoost — full history") |>
+  dplyr::mutate(model = "XGBoost — unadjusted")
+
+imbalance_fold_metrics <- dplyr::bind_rows(
+  unadjusted_xgboost_metrics,
+  adjusted_imbalance_metrics
+)
+
+assert_common_resamples(
+  split(imbalance_fold_metrics, imbalance_fold_metrics$model),
+  expected_ids = modeling_cv_folds$id
+)
+```
+
+**Results**
+
+## Performance and runtime
+
+```{r}
+#| label: compare-imbalance-strategies
+
+imbalance_comparison <- imbalance_fold_metrics |>
+  dplyr::group_by(.data$model, .data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_dev = stats::sd(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    folds = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(.data$.metric, dplyr::desc(.data$mean))
+
+knitr::kable(
+  imbalance_comparison,
+  digits = 4,
+  caption = "Cross-validated class-imbalance comparison"
+)
+
+unadjusted_runtime <- candidate_runtime |>
+  dplyr::filter(.data$model == "XGBoost — full history") |>
+  dplyr::mutate(model = "XGBoost — unadjusted")
+
+imbalance_runtime <- dplyr::bind_rows(
+  unadjusted_runtime,
+  adjusted_imbalance_runtime
+)
+
+knitr::kable(
+  imbalance_runtime,
+  digits = 1,
+  caption = "Elapsed time for three-fold imbalance strategies"
+)
+```
+
+Accuracy remains secondary. Weighting or sampling can change how many applicants cross the default 0.5 classification threshold, but that threshold has not been tied to approval policy or asymmetric business costs. ROC-AUC remains the appropriate selection measure for this experiment.
+
+## Imbalance finding
+
+```{r}
+#| label: imbalance-finding
+
+imbalance_auc <- imbalance_comparison |>
+  dplyr::filter(.data$.metric == "roc_auc") |>
+  dplyr::arrange(dplyr::desc(.data$mean))
+
+best_imbalance_strategy <- imbalance_auc |>
+  dplyr::slice(1)
+
+stopifnot(
+  "The Section 7 narrative requires unadjusted XGBoost to win Section 6" =
+    identical(best_imbalance_strategy$model, "XGBoost — unadjusted")
+)
+
+unadjusted_imbalance_auc <- imbalance_auc$mean[
+  imbalance_auc$model == "XGBoost — unadjusted"
+]
+
+imbalance_checks <- c(
+  "Every strategy has three ROC-AUC estimates" = all(
+    table(
+      imbalance_fold_metrics$model[
+        imbalance_fold_metrics$.metric == "roc_auc"
+      ]
+    ) == 3L
+  ),
+  "Every strategy uses approved folds" = isTRUE(
+    assert_common_resamples(
+      split(imbalance_fold_metrics, imbalance_fold_metrics$model),
+      expected_ids = modeling_cv_folds$id
+    )
+  ),
+  "No adjusted fit produced an error" = all(vapply(
+    imbalance_runs,
+    function(run) !nrow(run$notes) || !any(run$notes$type == "error"),
+    logical(1)
+  ))
+)
+
+if (!all(imbalance_checks)) {
+  stop(
+    "Imbalance comparison validation failed: ",
+    paste(names(imbalance_checks)[!imbalance_checks], collapse = "; ")
+  )
+}
+
+imbalance_finding <- data.frame(
+  finding = c(
+    "Best imbalance strategy",
+    "Best mean ROC-AUC",
+    "Change from unadjusted XGBoost"
+  ),
+  result = c(
+    best_imbalance_strategy$model,
+    sprintf("%.4f", best_imbalance_strategy$mean),
+    sprintf(
+      "%+.4f ROC-AUC",
+      best_imbalance_strategy$mean - unadjusted_imbalance_auc
+    )
+  )
+)
+
+knitr::kable(
+  imbalance_finding,
+  caption = "Class-imbalance experiment finding"
+)
+```
+
+Weighting and resampling change the training objective and, for SMOTE and downsampling, the apparent analysis-fold class distribution. Their raw predicted probabilities should therefore not automatically be interpreted as calibrated payment-difficulty probabilities. Any adjusted strategy retained after tuning would require calibration assessment on untouched validation predictions.
+
+**Implications**
+
+`r if (identical(best_imbalance_strategy$model, "XGBoost — unadjusted")) sprintf("No tested imbalance adjustment beats unadjusted XGBoost (best mean ROC-AUC %.4f), so tuning should retain the observed class distribution.", best_imbalance_strategy$mean) else sprintf("%s improves mean ROC-AUC by %+.4f and should be carried into tuning.", best_imbalance_strategy$model, best_imbalance_strategy$mean - unadjusted_imbalance_auc)` This conclusion concerns ranking performance, not a decision threshold or subgroup equity.
+
+**Takeaway from Section 6:** `r if (identical(best_imbalance_strategy$model, "XGBoost — unadjusted")) "Class imbalance does not require synthetic sampling or weighting for the selected ranking objective." else "The best-performing imbalance adjustment should accompany the model into tuning."`
+
+# Section 7: Randomized XGBoost tuning
+
+**Purpose**
+
+`r if (identical(best_candidate$model, "XGBoost — full history") && identical(best_imbalance_strategy$model, "XGBoost — unadjusted")) "Unadjusted full-history XGBoost was the strongest candidate across Sections 5 and 6." else sprintf("The strongest Section 5 candidate was %s, and the strongest Section 6 strategy was %s.", best_candidate$model, best_imbalance_strategy$model)` This section searches a broader set of XGBoost configurations using a relatively small stratified sample, 3-fold cross-validation, and 20 randomized space-filling combinations. This follows the assignment's computational guidance and avoids an exhaustive grid.
+
+The tuning-sample results are compared with the untuned XGBoost specification on the **same sample and folds**. They are not treated as directly comparable to the earlier full-data cross-validation estimate.
+
+**Connection:** Section 6 determines the imbalance treatment carried into this search; this section changes model parameters while preserving that choice.
+
+**Method**
+
+## Stratified tuning sample
+
+```{r}
+#| label: create-tuning-sample
+
+tuning_sample <- create_tuning_sample(
+  train_modeling_base,
+  size = 5000L,
+  outcome_col = "TARGET",
+  seed = model_seed
+)
+
+tuning_folds <- create_stratified_folds(
+  tuning_sample,
+  outcome_col = "TARGET",
+  v = 3L,
+  seed = model_seed
+)
+
+validate_cv_folds(
+  tuning_folds,
+  id_col = "SK_ID_CURR",
+  outcome_col = "TARGET",
+  expected_v = 3L
+)
+
+full_event_rate <- mean(
+  train_modeling_base$TARGET == payment_difficulty_level
+)
+tuning_event_rate <- mean(
+  tuning_sample$TARGET == payment_difficulty_level
+)
+
+tuning_sample_checks <- c(
+  "Tuning sample is not approximately 5,000 rows" =
+    abs(nrow(tuning_sample) - 5000L) <= 10L,
+  "Tuning sample IDs are duplicated" =
+    !anyDuplicated(tuning_sample$SK_ID_CURR),
+  "Tuning prevalence differs materially from full training" =
+    abs(tuning_event_rate - full_event_rate) < 0.005,
+  "Tuning folds are not three-fold" = nrow(tuning_folds) == 3L
+)
+
+if (!all(tuning_sample_checks)) {
+  stop(
+    "Tuning-sample validation failed: ",
+    paste(names(tuning_sample_checks)[!tuning_sample_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  data.frame(
+    population = c("Full training", "Tuning sample"),
+    applicants = c(nrow(train_modeling_base), nrow(tuning_sample)),
+    payment_difficulty_cases = c(
+      sum(train_modeling_base$TARGET == payment_difficulty_level),
+      sum(tuning_sample$TARGET == payment_difficulty_level)
+    ),
+    payment_difficulty_rate = c(full_event_rate, tuning_event_rate)
+  ),
+  digits = 4,
+  caption = "Full training and stratified tuning-sample distributions",
+  format.args = list(big.mark = ",")
+)
+```
+
+The tuning sample is used only to compare hyperparameters efficiently. The final selected specification will later be fitted using all available training applicants.
+
+## Randomized parameter space
+
+```{r}
+#| label: define-randomized-search
+
+tuning_recipe <- build_model_recipe(tuning_sample, feature_set = "full")
+
+tunable_xgboost_spec <- parsnip::boost_tree(
+  mtry = tune::tune(),
+  trees = tune::tune(),
+  min_n = tune::tune(),
+  tree_depth = tune::tune(),
+  learn_rate = tune::tune(),
+  loss_reduction = tune::tune(),
+  sample_size = tune::tune()
+) |>
+  parsnip::set_engine(
+    "xgboost",
+    nthread = resample_engine_threads,
+    verbosity = 0
+  ) |>
+  parsnip::set_mode("classification")
+
+tuning_workflow <- workflows::workflow() |>
+  workflows::add_recipe(tuning_recipe) |>
+  workflows::add_model(tunable_xgboost_spec)
+
+tuning_parameters <- hardhat::extract_parameter_set_dials(tuning_workflow) |>
+  stats::update(
+    mtry = dials::mtry(c(20L, 180L)),
+    trees = dials::trees(c(200L, 800L)),
+    min_n = dials::min_n(c(5L, 50L)),
+    tree_depth = dials::tree_depth(c(2L, 8L)),
+    learn_rate = dials::learn_rate(c(-2, log10(0.20))),
+    loss_reduction = dials::loss_reduction(c(-3, 1)),
+    sample_size = dials::sample_prop(c(0.60, 1.00))
+  )
+
+set.seed(model_seed)
+tuning_grid <- dials::grid_space_filling(
+  tuning_parameters,
+  size = 20,
+  type = "latin_hypercube"
+)
+
+if (nrow(tuning_grid) != 20L || anyDuplicated(tuning_grid)) {
+  stop("The randomized search grid must contain 20 unique configurations.")
+}
+
+parameter_ranges <- data.frame(
+  parameter = c(
+    "Predictors per split", "Trees", "Minimum node size", "Tree depth",
+    "Learning rate", "Minimum loss reduction", "Row sample"
+  ),
+  search_range = c(
+    "20–180", "200–800", "5–50", "2–8", "0.01–0.20",
+    "0.001–10 (log scale)", "0.60–1.00"
+  )
+)
+
+knitr::kable(
+  parameter_ranges,
+  caption = "Randomized XGBoost search space"
+)
+```
+
+The Latin-hypercube design is randomized but spreads 20 candidates across the multidimensional range more efficiently than drawing every parameter independently. It remains a randomized search, not an exhaustive enumeration.
+
+## Execute the 20-candidate search
+
+```{r}
+#| label: run-randomized-tuning
+
+tuning_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  model = tunable_xgboost_spec,
+  parameter_ranges = tuning_parameters,
+  grid = tuning_grid,
+  fold_ids = tuning_folds$id
+))
+
+# Evaluate the 20 space-filling configurations across the three tuning folds.
+tuning_run <- cached_modeling_result("randomized_tuning", run_randomized_tuning(
+  workflow = tuning_workflow,
+  folds = tuning_folds,
+  grid = tuning_grid,
+  metrics = comparison_metrics,
+  seed = model_seed,
+  selection_metric = "roc_auc"
+), spec_signature = tuning_spec_signature)
+
+tuning_auc_folds <- tuning_run$fold_metrics |>
+  dplyr::filter(.data$.metric == "roc_auc")
+
+tuning_config_counts <- table(tuning_auc_folds$.config)
+if (
+  length(tuning_config_counts) != 20L ||
+    !all(tuning_config_counts == 3L)
+) {
+  stop("Each of the 20 tuning configurations must have three ROC-AUC estimates.")
+}
+
+if (nrow(tuning_run$notes) > 0) {
+  tuning_note_summary <- tuning_run$notes |>
+    dplyr::count(.data$type, .data$note, name = "occurrences")
+  knitr::kable(
+    tuning_note_summary,
+    caption = "Compact summary of non-error tuning notes"
+  )
+}
+```
+
+All configurations use the same tuning applicants and fold assignments. Preprocessing is refitted separately inside each fold, just as it was during the full-data candidate comparison.
+
+**Results**
+
+## Leading tuning configurations
+
+```{r}
+#| label: rank-tuning-configurations
+
+tuning_accuracy <- tuning_run$summary_metrics |>
+  dplyr::filter(.data$.metric == "accuracy") |>
+  dplyr::select(.data$.config, accuracy_mean = .data$mean)
+
+tuning_ranked <- tuning_run$summary_metrics |>
+  dplyr::filter(.data$.metric == "roc_auc") |>
+  dplyr::left_join(tuning_accuracy, by = ".config") |>
+  dplyr::arrange(dplyr::desc(.data$mean))
+
+top_tuning_results <- tuning_ranked |>
+  dplyr::slice_head(n = 10) |>
+  dplyr::select(
+    .data$.config,
+    .data$mtry,
+    .data$trees,
+    .data$min_n,
+    .data$tree_depth,
+    .data$learn_rate,
+    .data$loss_reduction,
+    .data$sample_size,
+    roc_auc_mean = .data$mean,
+    roc_auc_std_error = .data$std_err,
+    .data$accuracy_mean
+  )
+
+knitr::kable(
+  top_tuning_results,
+  digits = 4,
+  caption = "Top randomized configurations ranked by tuning-sample ROC-AUC"
+)
+
+knitr::kable(
+  data.frame(
+    measurement = c("Configurations", "Folds per configuration", "Elapsed seconds"),
+    value = c(20, 3, round(tuning_run$elapsed_seconds, 1))
+  ),
+  caption = "Randomized-search execution summary"
+)
+```
+
+The leading configuration is selected on mean ROC-AUC only. Accuracy is displayed for context but does not determine the winner.
+
+## Same-fold untuned control
+
+```{r}
+#| label: tuning-sample-control
+
+control_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  model = xgboost_spec,
+  features = feature_manifests$full,
+  fold_ids = tuning_folds$id
+))
+
+untuned_control <- cached_modeling_result("tuning_sample_control", run_candidate_model(
+  model_label = "Untuned XGBoost — tuning sample",
+  model_spec = xgboost_spec,
+  recipe = tuning_recipe,
+  folds = tuning_folds,
+  metrics = comparison_metrics,
+  seed = model_seed
+), spec_signature = control_spec_signature)
+
+untuned_control_summary <- untuned_control$metrics |>
+  dplyr::group_by(.data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    .groups = "drop"
+  )
+
+best_tuning_auc <- tuning_ranked$mean[1]
+best_tuning_se <- tuning_ranked$std_err[1]
+untuned_tuning_auc <- untuned_control_summary$mean[
+  untuned_control_summary$.metric == "roc_auc"
+]
+
+same_fold_comparison <- data.frame(
+  model = c(
+    "Untuned XGBoost — tuning sample",
+    "Best randomized configuration — tuning sample"
+  ),
+  mean_roc_auc = c(untuned_tuning_auc, best_tuning_auc),
+  std_error = c(
+    untuned_control_summary$std_error[
+      untuned_control_summary$.metric == "roc_auc"
+    ],
+    best_tuning_se
+  ),
+  folds = 3L
+)
+
+knitr::kable(
+  same_fold_comparison,
+  digits = 4,
+  caption = "Tuned and untuned XGBoost on identical 5K-sample folds"
+)
+```
+
+This is the valid estimate of tuning improvement because both rows use identical data and fold assignments. The tuning-sample AUC should not be subtracted from the earlier full-data AUC; sample size and assessment applicants differ.
+
+## Selected parameters
+
+```{r}
+#| label: select-tuned-parameters
+
+selected_parameters <- tuning_run$best_parameters
+
+selected_checks <- c(
+  "Best configuration is missing" = nrow(selected_parameters) == 1L,
+  "Selected configuration lacks a tuning result" =
+    selected_parameters$.config %in% tuning_ranked$.config,
+  "Tuning produced an error note" =
+    !nrow(tuning_run$notes) || !any(tuning_run$notes$type == "error")
+)
+
+if (!all(selected_checks)) {
+  stop(
+    "Tuning selection validation failed: ",
+    paste(names(selected_checks)[!selected_checks], collapse = "; ")
+  )
+}
+
+selected_display <- data.frame(
+  parameter = c(
+    "mtry", "trees", "min_n", "tree_depth", "learn_rate",
+    "loss_reduction", "sample_size", "configuration"
+  ),
+  selected_value = c(
+    selected_parameters$mtry,
+    selected_parameters$trees,
+    selected_parameters$min_n,
+    selected_parameters$tree_depth,
+    selected_parameters$learn_rate,
+    selected_parameters$loss_reduction,
+    selected_parameters$sample_size,
+    selected_parameters$.config
+  )
+)
+
+knitr::kable(
+  selected_display,
+  digits = 5,
+  caption = "Parameters locked for final full-data training"
+)
+
+tuning_finding <- data.frame(
+  finding = c(
+    "Untuned mean ROC-AUC on tuning folds",
+    "Best tuned mean ROC-AUC on tuning folds",
+    "Same-fold tuning change",
+    "Tuning improved the same-fold control"
+  ),
+  result = c(
+    sprintf("%.4f", untuned_tuning_auc),
+    sprintf("%.4f", best_tuning_auc),
+    sprintf("%+.4f ROC-AUC", best_tuning_auc - untuned_tuning_auc),
+    ifelse(best_tuning_auc > untuned_tuning_auc, "Yes", "No")
+  )
+)
+
+knitr::kable(
+  tuning_finding,
+  caption = "Randomized-tuning finding"
+)
+```
+
+The selected configuration is now locked. It will be used without further search when the final model is trained on the complete training population. The 5K tuning estimate is useful for relative parameter selection but remains less precise than a full-data validation estimate.
+
+**Implications**
+
+`r if (best_tuning_auc > untuned_tuning_auc) sprintf("On the same 5K tuning folds, randomized tuning improves mean ROC-AUC by %+.4f; the selected settings therefore merit confirmation on the full-data folds.", best_tuning_auc - untuned_tuning_auc) else sprintf("Randomized tuning changes mean ROC-AUC by %+.4f and does not beat the untuned control, so the untuned settings remain the stronger provisional choice.", best_tuning_auc - untuned_tuning_auc)` The small tuning sample is used for efficient parameter selection, not as final performance evidence.
+
+**Takeaway from Section 7:** `r if (best_tuning_auc > untuned_tuning_auc) "The tuning search found a promising configuration, but full-data confirmation is required before selection." else "The randomized search did not justify replacing the untuned configuration."`
+
+# Section 8: Full-data confirmation of the tuned candidate
+
+**Purpose**
+
+This section applies the locked Section 7 parameters without further search and measures the locked workflow on the established full-data folds. Because model selection occurs only after this confirmation, the tuned workflow is not fitted separately on all 307,511 rows unless it wins the comparison.
+
+**Connection:** The small-sample tuning result is returned to the full-data folds here so model selection rests on the stronger validation population.
+
+The full-data confirmation is useful because the tuning sample is intentionally small. It is not described as a fully independent nested-CV estimate: the 5K tuning applicants come from the same development population and can appear in the established folds.
+
+**Method**
+
+## Locked XGBoost workflow
+
+```{r}
+#| label: define-locked-workflow
+
+locked_xgboost_spec <- parsnip::boost_tree(
+  mtry = as.integer(selected_parameters$mtry),
+  trees = as.integer(selected_parameters$trees),
+  min_n = as.integer(selected_parameters$min_n),
+  tree_depth = as.integer(selected_parameters$tree_depth),
+  learn_rate = selected_parameters$learn_rate,
+  loss_reduction = selected_parameters$loss_reduction,
+  sample_size = selected_parameters$sample_size
+) |>
+  parsnip::set_engine(
+    "xgboost",
+    nthread = resample_engine_threads,
+    verbosity = 0
+  ) |>
+  parsnip::set_mode("classification")
+
+locked_workflow <- workflows::workflow() |>
+  workflows::add_recipe(full_history_recipe) |>
+  workflows::add_model(locked_xgboost_spec)
+
+locked_specification <- data.frame(
+  parameter = c(
+    "mtry", "trees", "min_n", "tree_depth", "learn_rate",
+    "loss_reduction", "sample_size", "imbalance strategy",
+    "feature set"
+  ),
+  value = c(
+    selected_parameters$mtry,
+    selected_parameters$trees,
+    selected_parameters$min_n,
+    selected_parameters$tree_depth,
+    selected_parameters$learn_rate,
+    selected_parameters$loss_reduction,
+    selected_parameters$sample_size,
+    "Unadjusted",
+    "Application plus supplementary history"
+  )
+)
+
+knitr::kable(
+  locked_specification,
+  digits = 5,
+  caption = "Locked final-workflow specification"
+)
+```
+
+`r if (identical(best_imbalance_strategy$model, "XGBoost — unadjusted")) "The imbalance strategy remains unadjusted because none of the tested Section 6 alternatives improved mean ROC-AUC." else sprintf("The confirmation carries forward %s because it had the highest Section 6 mean ROC-AUC.", best_imbalance_strategy$model)` The recipe remains fold-safe during confirmation. Only the model selected from the confirmation evidence will later be fitted on all training rows.
+
+**Results**
+
+## Full-data post-tuning confirmation
+
+```{r}
+#| label: confirm-locked-full-data
+
+locked_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  model = locked_xgboost_spec,
+  selected_parameters = selected_parameters,
+  features = feature_manifests$full,
+  fold_ids = modeling_cv_folds$id
+))
+
+locked_confirmation <- cached_modeling_result("locked_full_confirmation", run_candidate_model(
+  model_label = "Locked tuned XGBoost — full history",
+  model_spec = locked_xgboost_spec,
+  recipe = full_history_recipe,
+  folds = modeling_cv_folds,
+  metrics = comparison_metrics,
+  seed = model_seed
+), spec_signature = locked_spec_signature)
+
+locked_confirmation_summary <- locked_confirmation$metrics |>
+  dplyr::group_by(.data$.metric) |>
+  dplyr::summarise(
+    mean = mean(.data$.estimate),
+    std_dev = stats::sd(.data$.estimate),
+    std_error = stats::sd(.data$.estimate) / sqrt(dplyr::n()),
+    folds = dplyr::n(),
+    .groups = "drop"
+  )
+
+locked_auc <- locked_confirmation_summary$mean[
+  locked_confirmation_summary$.metric == "roc_auc"
+]
+locked_auc_se <- locked_confirmation_summary$std_error[
+  locked_confirmation_summary$.metric == "roc_auc"
+]
+
+full_data_confirmation <- dplyr::bind_rows(
+  data.frame(
+    model = "Untuned XGBoost — full history",
+    mean_roc_auc = unname(
+      auc_lookup["XGBoost — full history"]
+    ),
+    std_error = auc_comparison$std_error[
+      auc_comparison$model == "XGBoost — full history"
+    ],
+    folds = 3L
+  ),
+  data.frame(
+    model = "Locked tuned XGBoost — full history",
+    mean_roc_auc = locked_auc,
+    std_error = locked_auc_se,
+    folds = 3L
+  )
+)
+
+confirmation_checks <- c(
+  "Locked confirmation lacks three folds" = all(
+    table(locked_confirmation$metrics$id) == 2L
+  ) && length(unique(locked_confirmation$metrics$id)) == 3L,
+  "Locked confirmation produced an error note" =
+    !nrow(locked_confirmation$notes) ||
+      !any(locked_confirmation$notes$type == "error"),
+  "Locked confirmation ROC-AUC is invalid" =
+    is.finite(locked_auc) && locked_auc >= 0 && locked_auc <= 1
+)
+
+if (!all(confirmation_checks)) {
+  stop(
+    "Full-data confirmation failed: ",
+    paste(names(confirmation_checks)[!confirmation_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  full_data_confirmation,
+  digits = 4,
+  caption = "Untuned and locked tuned XGBoost on established full-data folds"
+)
+```
+
+The confirmation comparison shows whether the parameter pattern selected on 5,000 rows transfers to the complete development population. The settings remain locked regardless of this result; no second search is conducted on the full folds.
+
+## Retain the tuned audit record without a full-data fit
+
+```{r}
+#| label: save-tuned-cv-record
+
+model_dir <- file.path(project_root, "models")
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+tuned_cv_record_path <- file.path(model_dir, "tuned_xgboost_cv_record.rds")
+
+verification_data <- train_modeling_base[seq_len(100L), , drop = FALSE]
+
+tuned_cv_record <- list(
+  model_name = "Home Credit locked tuned XGBoost candidate",
+  disposition = "Not selected; no separate full-data model fit",
+  parameters = as.list(selected_parameters),
+  tuning_sample_cv = same_fold_comparison,
+  full_data_cv = full_data_confirmation,
+  full_data_fold_metrics = locked_confirmation$metrics,
+  seed = model_seed,
+  modeling_spec_signature = locked_spec_signature,
+  validation_folds = 3L,
+  tuning_sample_rows = nrow(tuning_sample),
+  tuning_configurations = nrow(tuning_grid)
+)
+saveRDS(tuned_cv_record, tuned_cv_record_path)
+
+knitr::kable(
+  data.frame(
+    retained_item = c(
+      "Locked tuned parameters",
+      "5K tuning-fold comparison",
+      "Full-data 3-fold confirmation",
+      "Separate full-data fitted workflow"
+    ),
+    status = c("Retained", "Retained", "Retained", "Not created")
+  ),
+  caption = "Tuned-candidate audit record"
+)
+```
+
+The compact audit record preserves the tuned parameters and both levels of cross-validation evidence. It does not contain a fitted XGBoost workflow, avoiding an unnecessary full-data fit and duplicate model artifact.
+
+**Implications**
+
+`r if (locked_auc > unname(auc_lookup["XGBoost — full history"])) sprintf("The locked tuned model improves full-data mean ROC-AUC by %+.4f and is supported for final selection.", locked_auc - unname(auc_lookup["XGBoost — full history"])) else sprintf("The locked tuned model trails the untuned full-history XGBoost by %+.4f ROC-AUC, so tuning-sample gains do not transfer to the full development population.", locked_auc - unname(auc_lookup["XGBoost — full history"]))` Its parameters and CV evidence remain auditable, but no unselected full-data workflow is fitted or saved.
+
+**Takeaway from Section 8:** `r if (locked_auc > unname(auc_lookup["XGBoost — full history"])) "The tuned configuration is supported by full-data confirmation." else "The tuned configuration is not supported by full-data confirmation; final selection also considers the native-missing experiment."`
+
+# Section 9: Final selection and business interpretation
+
+**Purpose**
+
+This section connects the validation evidence to a final model choice and translates out-of-fold predictions into risk concentration, calibration, and feature-importance evidence that the business can interpret without treating the model as an approval policy.
+
+**Connection:** The full-data comparison from Section 8 determines which workflow is interpreted and preserved as the selected model.
+
+**Method**
+
+## Final model decision
+
+`r if (best_tuning_auc > untuned_tuning_auc) sprintf("The 5K tuning exercise improved mean ROC-AUC by %+.4f over the untuned control on the same small tuning folds.", best_tuning_auc - untuned_tuning_auc) else sprintf("The 5K tuning exercise changed mean ROC-AUC by %+.4f and did not improve over the untuned control on the same small tuning folds.", best_tuning_auc - untuned_tuning_auc)` On the established full-data folds, locked tuned XGBoost achieved ROC-AUC `r sprintf("%.4f", locked_auc)`, compared with `r sprintf("%.4f", unname(auc_lookup["XGBoost — full history"]))` for untuned full-history XGBoost. The fold-mean value differs slightly from the pooled out-of-fold ROC-AUC reported below because one averages three fold statistics while the other calculates one statistic over all out-of-fold predictions.
+
+The final selection therefore follows the strongest full-data validation evidence. The selected model uses the untuned full-history XGBoost specification with native numeric missing-value routing. The tuned parameters and CV results remain saved in a compact audit record; no unselected tuned workflow is fitted on all rows.
+
+```{r}
+#| label: select-final-validated-model
+
+# Selection is guarded by full-data CV rather than the smaller tuning-sample result.
+stopifnot(
+  "Native-missing XGBoost must outperform both imputed and locked tuned alternatives" =
+    native_missing_auc > unname(auc_lookup["XGBoost — full history"]) &&
+      native_missing_auc > locked_auc
+)
+
+selected_model_parameters <- list(
+  mtry = 100L,
+  trees = 300L,
+  min_n = 10L,
+  tree_depth = 6L,
+  learn_rate = 0.05,
+  loss_reduction = 0,
+  sample_size = 0.8
+)
+
+selected_xgboost_spec <- parsnip::boost_tree(
+  mtry = selected_model_parameters$mtry,
+  trees = selected_model_parameters$trees,
+  min_n = selected_model_parameters$min_n,
+  tree_depth = selected_model_parameters$tree_depth,
+  learn_rate = selected_model_parameters$learn_rate,
+  loss_reduction = selected_model_parameters$loss_reduction,
+  sample_size = selected_model_parameters$sample_size
+) |>
+  parsnip::set_engine("xgboost", nthread = 4, verbosity = 0) |>
+  parsnip::set_mode("classification")
+
+selected_workflow <- workflows::workflow() |>
+  workflows::add_recipe(native_missing_recipe) |>
+  workflows::add_model(selected_xgboost_spec)
+
+selected_model_spec_signature <- digest::digest(list(
+  seed = model_seed,
+  model = selected_xgboost_spec,
+  parameters = selected_model_parameters,
+  missing_strategy = "native_xgboost",
+  features = feature_manifests$full
+))
+
+selection_summary <- data.frame(
+  candidate = c(
+    "Untuned full-history XGBoost — native missing",
+    "Untuned full-history XGBoost",
+    "5K-tuned full-history XGBoost"
+  ),
+  full_data_cv_roc_auc = c(
+    native_missing_auc,
+    unname(auc_lookup["XGBoost — full history"]),
+    locked_auc
+  ),
+  std_error = c(
+    native_missing_auc_se,
+    auc_comparison$std_error[
+      auc_comparison$model == "XGBoost — full history"
+    ],
+    locked_auc_se
+  ),
+  disposition = c(
+    "Selected",
+    "Not selected",
+    "Retained as tuning audit artifact"
+  )
+)
+
+knitr::kable(
+  selection_summary,
+  digits = 4,
+  caption = "Final model selection based on full-data cross-validation"
+)
+```
+
+This choice does not invalidate the tuning exercise. It documents that a parameter pattern found on 5,000 rows was not sufficiently stable when evaluated across the full development population.
+
+**Results**
+
+## Out-of-fold predictions for the selected model
+
+```{r}
+#| label: selected-model-oof-predictions
+
+selected_oof <- list(
+  model = "Selected native-missing full-history XGBoost",
+  metrics = native_missing_run$metrics,
+  predictions = native_missing_run$predictions,
+  notes = native_missing_run$notes,
+  elapsed_seconds = native_missing_run$elapsed_seconds
+)
+
+oof_predictions <- selected_oof$predictions
+probability_column <- ".pred_payment_difficulty"
+
+required_oof_columns <- c(".row", "TARGET", probability_column, "id")
+if (!all(required_oof_columns %in% names(oof_predictions))) {
+  stop("Out-of-fold predictions lack required columns.")
+}
+
+oof_predictions$SK_ID_CURR <- train_modeling_base$SK_ID_CURR[
+  oof_predictions$.row
+]
+
+oof_checks <- c(
+  "Out-of-fold prediction count differs from training" =
+    nrow(oof_predictions) == nrow(train_modeling_base),
+  "An applicant lacks an out-of-fold prediction" = setequal(
+    oof_predictions$SK_ID_CURR,
+    train_modeling_base$SK_ID_CURR
+  ),
+  "An applicant has multiple out-of-fold predictions" =
+    !anyDuplicated(oof_predictions$SK_ID_CURR),
+  "Out-of-fold probabilities contain missing values" =
+    !anyNA(oof_predictions[[probability_column]]),
+  "Out-of-fold probabilities fall outside 0–1" = all(
+    oof_predictions[[probability_column]] >= 0 &
+      oof_predictions[[probability_column]] <= 1
+  )
+)
+
+if (!all(oof_checks)) {
+  stop(
+    "Out-of-fold prediction validation failed: ",
+    paste(names(oof_checks)[!oof_checks], collapse = "; ")
+  )
+}
+
+selected_oof_auc <- yardstick::roc_auc_vec(
+  truth = oof_predictions$TARGET,
+  estimate = oof_predictions[[probability_column]],
+  event_level = "first"
+)
+
+stopifnot(
+  "Sections 9–10 and the Conclusion require supplementary history to improve XGBoost" =
+    xgboost_supplementary_auc_change > 0,
+  "Sections 9–10 and the Conclusion require the selected model to remain below 0.79" =
+    selected_oof_auc < 0.79
+)
+
+if (abs(selected_oof_auc - native_missing_auc) > 0.0005) {
+  stop("Reproduced out-of-fold ROC-AUC differs from the selected-model estimate.")
+}
+
+knitr::kable(
+  data.frame(
+    check = c(
+      "Applicants with one out-of-fold probability",
+      "Reproduced ROC-AUC",
+      "Fitting errors"
+    ),
+    result = c(
+      format(nrow(oof_predictions), big.mark = ",", scientific = FALSE),
+      sprintf("%.4f", selected_oof_auc),
+      "None"
+    )
+  ),
+  caption = "Selected-model out-of-fold validation"
+)
+```
+
+Every probability above comes from a model that did not train on that applicant. These predictions support the ranking and calibration summaries below without substituting optimistic in-sample results.
+
+## Risk concentration by out-of-fold decile
+
+```{r}
+#| label: oof-risk-deciles
+
+risk_deciles <- oof_predictions |>
+  dplyr::mutate(
+    event = .data$TARGET == payment_difficulty_level,
+    risk_decile = dplyr::ntile(.data[[probability_column]], 10L)
+  ) |>
+  dplyr::group_by(.data$risk_decile) |>
+  dplyr::summarise(
+    applicants = dplyr::n(),
+    events = sum(.data$event),
+    mean_predicted_risk = mean(.data[[probability_column]]),
+    observed_event_rate = mean(.data$event),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(.data$risk_decile)) |>
+  dplyr::mutate(
+    event_capture = .data$events / sum(.data$events),
+    cumulative_event_capture = cumsum(.data$events) / sum(.data$events),
+    risk_label = paste0("Decile ", .data$risk_decile)
+  ) |>
+  dplyr::select(
+    .data$risk_label,
+    .data$applicants,
+    .data$events,
+    .data$mean_predicted_risk,
+    .data$observed_event_rate,
+    .data$event_capture,
+    .data$cumulative_event_capture
+  )
+
+knitr::kable(
+  risk_deciles,
+  digits = 4,
+  caption = "Out-of-fold risk concentration from highest to lowest predicted decile",
+  format.args = list(big.mark = ",")
+)
+```
+
+`r sprintf("If review capacity were limited to the highest-risk 10%% of applicants, the model would identify %.2f%% of observed payment-difficulty cases; that reviewed group has an observed event rate of %.2f%%.", 100 * risk_deciles$event_capture[risk_deciles$risk_label == "Decile 10"], 100 * risk_deciles$observed_event_rate[risk_deciles$risk_label == "Decile 10"])`
+
+The deciles describe ranking, not approval bands. They show how effectively the model concentrates observed payment difficulty among applicants assigned higher risk, which can support review prioritization or policy simulation once decision costs and risk appetite are supplied.
+
+## Calibration diagnostics
+
+```{r}
+#| label: oof-calibration
+
+selected_brier <- yardstick::brier_class_vec(
+  truth = oof_predictions$TARGET,
+  estimate = oof_predictions[[probability_column]],
+  event_level = "first"
+)
+
+observed_rate <- mean(
+  oof_predictions$TARGET == payment_difficulty_level
+)
+mean_predicted_rate <- mean(oof_predictions[[probability_column]])
+constant_prevalence_brier <- observed_rate * (1 - observed_rate)
+
+calibration_summary <- data.frame(
+  diagnostic = c(
+    "Observed payment-difficulty rate",
+    "Mean predicted probability",
+    "Selected-model Brier score",
+    "Constant-prevalence Brier score"
+  ),
+  value = c(
+    observed_rate,
+    mean_predicted_rate,
+    selected_brier,
+    constant_prevalence_brier
+  )
+)
+
+knitr::kable(
+  calibration_summary,
+  digits = 5,
+  caption = "Out-of-fold probability calibration diagnostics"
+)
+```
+
+ROC-AUC measures ranking, while the Brier score measures squared probability error. The decile table provides the more detailed calibration view by comparing average predictions with observed outcomes across risk levels. A later production process should monitor both discrimination and calibration because portfolio mix and policy can change over time.
+
+**Finalization method**
+
+## Fit and preserve the selected final workflow
+
+```{r}
+#| label: fit-save-selected-workflow
+
+selected_model_path <- file.path(model_dir, "selected_xgboost_workflow.rds")
+selected_metadata_path <- file.path(model_dir, "selected_xgboost_metadata.rds")
+
+selected_metadata_input <- list(
+  model_name = "Home Credit selected native-missing full-history XGBoost",
+  selection_reason = paste(
+    "Highest established full-data cross-validated ROC-AUC among evaluated models"
+  ),
+  outcome = "TARGET",
+  event_level = payment_difficulty_level,
+  id_column = "SK_ID_CURR",
+  feature_set = "application_plus_supplementary_history",
+  missing_value_strategy = "native_xgboost_routing",
+  imbalance_strategy = "unadjusted",
+  seed = model_seed,
+  modeling_spec_signature = selected_model_spec_signature,
+  model_parameters = selected_model_parameters,
+  full_cv_roc_auc = selected_oof_auc,
+  full_cv_roc_auc_std_error = native_missing_auc_se,
+  brier_score = selected_brier,
+  validation_folds = 3L
+)
+
+saved_selected_metadata <- if (file.exists(selected_metadata_path)) {
+  readRDS(selected_metadata_path)
+} else {
+  NULL
+}
+saved_selected_spec_matches <-
+  is.list(saved_selected_metadata) &&
+  identical(
+    saved_selected_metadata$model_parameters,
+    selected_model_parameters
+  ) &&
+  identical(
+    saved_selected_metadata$modeling_spec_signature,
+    selected_model_spec_signature
+  ) &&
+  identical(saved_selected_metadata$seed, model_seed)
+
+if (identical(modeling_run_mode, "development") &&
+    file.exists(selected_model_path) &&
+    saved_selected_spec_matches) {
+  selected_model_result <- load_verify_final_workflow(
+    model_path = selected_model_path,
+    metadata_path = selected_metadata_path,
+    verification_data = verification_data
+  )
+} else {
+  selected_model_result <- fit_save_verify_final_workflow(
+    workflow = selected_workflow,
+    training_data = train_modeling_base,
+    verification_data = verification_data,
+    model_path = selected_model_path,
+    metadata_path = selected_metadata_path,
+    metadata = selected_metadata_input
+  )
+}
+
+selected_recipe_fitted <- workflows::extract_recipe(
+  selected_model_result$fitted_workflow
+)
+selected_roles <- summary(selected_recipe_fitted)
+selected_predictors <- selected_roles$variable[
+  selected_roles$role == "predictor"
+]
+
+selected_artifact_checks <- c(
+  selected_model_result$checks,
+  "Selected model ID entered predictors" =
+    !"SK_ID_CURR" %in% selected_predictors,
+  "Selected model outcome entered predictors" =
+    !"TARGET" %in% selected_predictors,
+  "Selected model predictor matrix is empty" =
+    length(selected_predictors) > 0
+)
+
+if (!all(selected_artifact_checks)) {
+  stop(
+    "Selected-model artifact validation failed: ",
+    paste(names(selected_artifact_checks)[!selected_artifact_checks], collapse = "; ")
+  )
+}
+```
+
+Section 8 preserves the unselected tuned candidate as a compact CV record, while this section saves the only fitted full-data workflow. This preserves the modeling decision trail without maintaining a duplicate unselected model.
+
+**Final-model results**
+
+## Predictive importance
+
+```{r}
+#| label: selected-feature-importance
+
+selected_engine <- workflows::extract_fit_parsnip(
+  selected_model_result$fitted_workflow
+)$fit
+
+feature_importance <- xgboost::xgb.importance(model = selected_engine)
+feature_importance$theme <- classify_feature_theme(feature_importance$Feature)
+
+top_feature_importance <- feature_importance |>
+  dplyr::slice_max(order_by = .data$Gain, n = 20, with_ties = FALSE) |>
+  dplyr::select(.data$Feature, .data$theme, .data$Gain, .data$Cover, .data$Frequency)
+
+theme_importance <- feature_importance |>
+  dplyr::group_by(.data$theme) |>
+  dplyr::summarise(gain = sum(.data$Gain), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(.data$gain))
+
+knitr::kable(
+  top_feature_importance,
+  digits = 4,
+  caption = "Top selected-model predictors by XGBoost gain"
+)
+
+knitr::kable(
+  theme_importance,
+  digits = 4,
+  caption = "Predictive gain grouped by business-oriented feature theme"
+)
+```
+
+Gain measures how much tree splits using a field improve the XGBoost objective. It does not establish a causal relationship, a favorable or unfavorable direction, or whether changing the field would change payment outcomes. Anonymized external scores also remain less explainable than directly interpretable repayment-history measures.
+
+## Business and performance conclusion
+
+```{r}
+#| label: business-performance-summary
+
+top_decile_event_rate <- risk_deciles$observed_event_rate[
+  risk_deciles$risk_label == "Decile 10"
+]
+top_decile_capture <- risk_deciles$event_capture[
+  risk_deciles$risk_label == "Decile 10"
+]
+
+business_summary <- data.frame(
+  result = c(
+    "Majority-class ROC-AUC",
+    "Simple-logistic ROC-AUC",
+    "Selected-model ROC-AUC",
+    "Improvement over simple logistic",
+    "Project ROC-AUC target",
+    "Target reached",
+    "Highest-risk decile observed event rate",
+    "Events captured in highest-risk decile"
+  ),
+  value = c(
+    sprintf("%.4f", majority_auc),
+    sprintf("%.4f", logistic_auc),
+    sprintf("%.4f", selected_oof_auc),
+    sprintf("%+.4f", selected_oof_auc - logistic_auc),
+    "0.7900",
+    ifelse(selected_oof_auc >= 0.79, "Yes", "No"),
+    sprintf("%.2f%%", 100 * top_decile_event_rate),
+    sprintf("%.2f%%", 100 * top_decile_capture)
+  )
+)
+
+knitr::kable(
+  business_summary,
+  caption = "Selected-model performance and business-facing ranking summary"
+)
+
+selected_artifacts <- data.frame(
+  artifact = c("Selected fitted workflow", "Selected model metadata"),
+  file = c(basename(selected_model_path), basename(selected_metadata_path)),
+  size_megabytes = round(
+    file.info(c(selected_model_path, selected_metadata_path))$size / 1024^2,
+    2
+  ),
+  read_test = "Passed"
+)
+
+knitr::kable(
+  selected_artifacts,
+  caption = "Selected-model artifacts"
+)
+```
+
+The selected model materially improves risk ranking over both the majority classifier and simple logistic benchmark, and the supplementary-feature experiment shows that historical information adds incremental value. It does not reach the project's 0.79 ROC-AUC target, so that gap is reported rather than obscured.
+
+The model can support ranking applicants for additional review or policy simulation. It cannot by itself determine approvals. The supplied data do not contain rejected applicants, complete decision costs, pricing, recovery, or an approved risk threshold, and the model was developed on originated applications. Approval-rate lift and customer-impact claims therefore remain outside the evidence available here.
+
+## Consolidated experiment registry
+
+The registry below puts the benchmark, algorithm, feature-set, missing-data, imbalance, and tuning experiments in one place. Runtime is the elapsed time for the recorded resampling call and is therefore comparable only within this computing environment.
+
+```{r}
+#| label: consolidated-experiment-registry
+
+# Attach candidate runtimes where available; benchmark runtimes were not recorded.
+candidate_registry <- auc_comparison |>
+  dplyr::left_join(candidate_runtime, by = "model") |>
+  dplyr::mutate(
+    algorithm = dplyr::case_when(
+      .data$model == "Majority class" ~ "Majority classifier",
+      grepl("Ridge", .data$model) ~ "Ridge logistic",
+      grepl("Random forest", .data$model) ~ "Random forest",
+      grepl("XGBoost", .data$model) ~ "XGBoost",
+      TRUE ~ "Logistic regression"
+    ),
+    feature_set = dplyr::case_when(
+      grepl("application", .data$model, ignore.case = TRUE) ~ "Application only",
+      .data$model == "Majority class" ~ "None",
+      .data$model == "Simple logistic" ~ "Selected application predictors",
+      TRUE ~ "Application + supplementary history"
+    ),
+    missing_strategy = dplyr::case_when(
+      .data$model == "Simple logistic" ~ "Median + indicators",
+      grepl("XGBoost|Ridge|Random forest", .data$model) ~
+        "Median + indicators",
+      TRUE ~ "Not applicable"
+    ),
+    imbalance_strategy = "Observed distribution",
+    data_scope = "Full training; 3-fold CV",
+    decision = dplyr::case_when(
+      .data$model == "Majority class" ~ "No-skill benchmark",
+      .data$model == "Simple logistic" ~ "Interpretable benchmark",
+      .data$model == "XGBoost — full history" ~
+        "Baseline for imbalance, tuning and missing-data experiments",
+      TRUE ~ "Not advanced"
+    )
+  ) |>
+  dplyr::transmute(
+    experiment = .data$model,
+    .data$algorithm,
+    .data$feature_set,
+    .data$missing_strategy,
+    .data$imbalance_strategy,
+    .data$data_scope,
+    cv_auc = .data$mean,
+    std_error = .data$std_error,
+    runtime_seconds = .data$elapsed_seconds,
+    .data$decision
+  )
+
+adjusted_registry <- imbalance_comparison |>
+  dplyr::filter(
+    .data$.metric == "roc_auc",
+    .data$model != "XGBoost — unadjusted"
+  ) |>
+  dplyr::left_join(imbalance_runtime, by = "model") |>
+  dplyr::transmute(
+    experiment = .data$model,
+    algorithm = "XGBoost",
+    feature_set = "Application + supplementary history",
+    missing_strategy = "Median + indicators",
+    imbalance_strategy = sub("XGBoost — ", "", .data$model),
+    data_scope = "Full training; 3-fold CV",
+    cv_auc = .data$mean,
+    std_error = .data$std_error,
+    runtime_seconds = .data$elapsed_seconds,
+    decision = "Rejected; did not improve ranking"
+  )
+
+additional_registry <- data.frame(
+  experiment = c(
+    "XGBoost — full history, native missing",
+    "Best randomized XGBoost configuration",
+    "Locked tuned XGBoost — full confirmation"
+  ),
+  algorithm = "XGBoost",
+  feature_set = "Application + supplementary history",
+  missing_strategy = c(
+    "Native XGBoost routing",
+    "Median + indicators",
+    "Median + indicators"
+  ),
+  imbalance_strategy = "Observed distribution",
+  data_scope = c(
+    "Full training; 3-fold CV",
+    "5K tuning sample; 3-fold CV",
+    "Full training; 3-fold CV"
+  ),
+  cv_auc = c(native_missing_auc, best_tuning_auc, locked_auc),
+  std_error = c(native_missing_auc_se, best_tuning_se, locked_auc_se),
+  runtime_seconds = c(
+    native_missing_run$elapsed_seconds,
+    tuning_run$elapsed_seconds,
+    locked_confirmation$elapsed_seconds
+  ),
+  decision = c(
+    "Selected and fitted on all training rows",
+    "Advanced to full-data confirmation",
+    "Rejected after full-data confirmation"
+  )
+)
+
+experiment_registry <- dplyr::bind_rows(
+  candidate_registry,
+  adjusted_registry,
+  additional_registry
+) |>
+  dplyr::mutate(
+    scope_order = ifelse(
+      .data$data_scope == "5K tuning sample; 3-fold CV",
+      2L,
+      1L
+    )
+  ) |>
+  dplyr::arrange(.data$scope_order, dplyr::desc(.data$cv_auc)) |>
+  dplyr::select(-.data$scope_order)
+
+knitr::kable(
+  experiment_registry,
+  digits = 4,
+  caption = "Consolidated modeling experiment registry",
+  format.args = list(big.mark = ",")
+)
+```
+
+The 5K tuning-sample row is placed after all full-training experiments because its ROC-AUC is suitable for within-sample parameter selection but is not directly comparable with full-data cross-validation estimates.
+
+**Implications**
+
+`r if (selected_oof_auc > logistic_auc) sprintf("The selected model improves pooled out-of-fold ROC-AUC by %+.4f over simple logistic and captures %.2f%% of observed payment difficulties in the highest-risk decile.", selected_oof_auc - logistic_auc, 100 * top_decile_capture) else sprintf("The selected model does not improve on the simple logistic benchmark; its ROC-AUC difference is %+.4f.", selected_oof_auc - logistic_auc)` `r if (selected_brier < constant_prevalence_brier) sprintf("Its Brier score of %.5f also improves on the constant-prevalence reference of %.5f.", selected_brier, constant_prevalence_brier) else sprintf("Its Brier score of %.5f does not improve on the constant-prevalence reference of %.5f.", selected_brier, constant_prevalence_brier)` These results support prioritization for review, not an automatic approval threshold.
+
+**Takeaway from Section 9:** `r if (selected_oof_auc >= 0.79) "The selected model reaches the project discrimination target and provides useful risk concentration, subject to governance review." else "The selected model improves materially on the benchmarks and concentrates risk usefully, but it does not reach the 0.79 project target."`
+
+# Section 10: Governance, limitations, and conclusion
+
+## Carried-forward items from data preparation
+
+The data-preparation notebook identified several choices that required explicit closure during modeling. The table below records their disposition so unresolved assumptions are not lost between phases.
+
+| Carried-forward item | Modeling disposition | Remaining limitation or evidence |
+|---|---|---|
+| Raw, `log1p`, and capped amount representations | Not separately ablated for the selected tree model. All were retained in the full-history recipe. For trees, `log1p` preserves the exact split ordering of positive raw amounts, while capped copies differ only in the tails; XGBoost can ignore redundant versions through split selection. | This rationale is specific to the tree model. A formal ablation was not run, so the notebook does not claim that all three representations are independently valuable. |
+| `OWN_CAR_AGE_GT50` sensitivity | The plausibility flag remained an approved predictor, but a with/without sensitivity comparison was not run. | Treat as an unclosed robustness test before production use; inspect dependence and subgroup effects if the feature is materially important. |
+| NULL payment-date shortfall interpretation | The preparation rule was carried into installment aggregates and evaluated only as part of the complete supplementary feature set. | The meaning of a NULL payment date was not independently validated. Rebuild the installment features under an alternative interpretation as a sensitivity test when source-system documentation is available. |
+| `DAYS_EMPLOYED_SENTINEL` proxy overlap | The sentinel remained a predictor while age and organization fields remained audit-only. See the subgroup table for computed age-band performance. | The audit does not isolate the sentinel's incremental subgroup effect. Its overlap with pensioner/age information remains a proxy-governance concern requiring a targeted with/without review. |
+| Native-missing experiment sequencing | Class-imbalance and tuning experiments used the median-imputation recipe as their common baseline; they were not repeated after native missing routing won the final ablation. | The final selection compares both missing-data strategies on the established folds, but interactions between native missing routing, imbalance handling, and tuning remain untested. |
+| Explicit missingness indicators from EDA Q7/Q10 | Explicit indicators, including the `EXT_SOURCE_1` indicator used to document train/test shift, remain in benchmark and comparison models. The selected XGBoost model instead learns missingness implicitly through split routing. | Continue monitoring source-level missingness explicitly outside the final predictor matrix; native routing does not replace data-quality and population-shift monitoring. |
+
+These items do not invalidate the reported cross-validation results. They limit how confidently individual engineered fields can be defended or transferred into production.
+
+## Subgroup monitoring audit
+
+The EDA retained sensitive and proxy fields for auditing rather than prediction. This section joins those fields to the selected model's out-of-fold probabilities using `SK_ID_CURR`. It examines gender, age bands, and current contract type as monitoring dimensions.
+
+ROC-AUC and Brier score are suppressed for groups with fewer than 1,000 applicants or 100 observed payment-difficulty cases. The thresholds prevent very small groups from producing apparently precise performance estimates. They are analytical stability rules, not legal safe harbors or definitions of fairness.
+
+```{r}
+#| label: subgroup-performance-audit
+
+audit_match <- match(
+  oof_predictions$SK_ID_CURR,
+  train_modeling_base$SK_ID_CURR
+)
+
+if (anyNA(audit_match)) {
+  stop("Out-of-fold applicants could not be matched to audit fields.")
+}
+
+subgroup_data <- data.frame(
+  SK_ID_CURR = oof_predictions$SK_ID_CURR,
+  TARGET = oof_predictions$TARGET,
+  .pred_payment_difficulty = oof_predictions[[probability_column]],
+  CODE_GENDER = train_modeling_base$CODE_GENDER[audit_match],
+  age_years = train_modeling_base$age_years[audit_match],
+  NAME_CONTRACT_TYPE = train_modeling_base$NAME_CONTRACT_TYPE[audit_match],
+  stringsAsFactors = FALSE
+)
+
+subgroup_data$age_band <- cut(
+  subgroup_data$age_years,
+  breaks = c(-Inf, 24, 34, 44, 54, 64, Inf),
+  labels = c("Under 25", "25–34", "35–44", "45–54", "55–64", "65+"),
+  right = TRUE
+)
+
+subgroup_audit <- dplyr::bind_rows(lapply(
+  c("CODE_GENDER", "age_band", "NAME_CONTRACT_TYPE"),
+  function(field) {
+    summarize_subgroup_performance(
+      subgroup_data,
+      group_col = field,
+      min_applicants = 1000L,
+      min_events = 100L
+    )
+  }
+))
+
+subgroup_checks <- c(
+  "Subgroup audit lost applicants" =
+    nrow(subgroup_data) == nrow(oof_predictions),
+  "Subgroup audit contains missing probabilities" =
+    !anyNA(subgroup_data$.pred_payment_difficulty),
+  "An undersized group was reported" = !any(
+    subgroup_audit$performance_status == "Reported" &
+      (subgroup_audit$applicants < 1000L | subgroup_audit$events < 100L)
+  )
+)
+
+reported_subgroup_audit <- subgroup_audit |>
+  dplyr::filter(
+    .data$performance_status == "Reported",
+    is.finite(.data$roc_auc)
+  )
+subgroup_auc_min <- if (nrow(reported_subgroup_audit)) {
+  min(reported_subgroup_audit$roc_auc)
+} else {
+  NA_real_
+}
+subgroup_auc_max <- if (nrow(reported_subgroup_audit)) {
+  max(reported_subgroup_audit$roc_auc)
+} else {
+  NA_real_
+}
+
+if (!all(subgroup_checks)) {
+  stop(
+    "Subgroup audit validation failed: ",
+    paste(names(subgroup_checks)[!subgroup_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  subgroup_audit,
+  digits = 4,
+  caption = "Out-of-fold subgroup monitoring audit",
+  format.args = list(big.mark = ",")
+)
+```
+
+Differences in observed rates, average predictions, ROC-AUC, or Brier score identify groups that require further review. They do not prove discrimination, establish causation, or determine whether a model complies with the laws of any jurisdiction. A production governance process would also assess threshold-specific approval and error rates after an operating policy is proposed.
+
+**Implications — subgroup audit:** `r if (nrow(reported_subgroup_audit) < 2L) "Too few subgroups meet the reporting thresholds to compare discrimination reliably; additional validation data are required." else if ((subgroup_auc_max - subgroup_auc_min) > 0.02) sprintf("Reported subgroup ROC-AUC ranges from %.4f to %.4f, a material spread of %.4f; targeted monitoring is warranted before a common operating threshold is considered.", subgroup_auc_min, subgroup_auc_max, subgroup_auc_max - subgroup_auc_min) else sprintf("Reported subgroup ROC-AUC ranges from %.4f to %.4f, a spread of %.4f; this gap is below the 0.02 monitoring trigger but should continue to be tracked.", subgroup_auc_min, subgroup_auc_max, subgroup_auc_max - subgroup_auc_min)` These descriptive differences are not, by themselves, a legal fairness conclusion.
+
+## Modeling objectives and results
+
+```{r}
+#| label: objective-completion-summary
+
+objective_summary <- data.frame(
+  objective = c(
+    "Majority-class accuracy and ROC-AUC benchmark",
+    "Simple logistic benchmark",
+    "Three-fold candidate-model comparison",
+    "Application-only versus supplementary-history comparison",
+    "Class weighting, downsampling, and SMOTE experiments",
+    "Twenty-configuration randomized search on approximately 5K rows",
+    "Final full-data model fit and reload test",
+    "Out-of-fold risk concentration and calibration",
+    "Subgroup monitoring audit",
+    "Kaggle prediction, submission, and score"
+  ),
+  status = c(
+    rep("Completed", 10)
+  ),
+  evidence = c(
+    sprintf("Accuracy %.4f; ROC-AUC %.4f",
+            benchmark_comparison$mean[
+              benchmark_comparison$model == "Majority class" &
+                benchmark_comparison$.metric == "accuracy"
+            ], majority_auc),
+    sprintf("ROC-AUC %.4f", logistic_auc),
+    "Logistic, ridge, random forest, and XGBoost on shared folds",
+    sprintf(
+      paste0(
+        "Supplementary-history change: ridge %+.4f; XGBoost %+.4f ROC-AUC"
+      ),
+      supplementary_auc_change,
+      xgboost_supplementary_auc_change
+    ),
+    sprintf("%s remained strongest", best_imbalance_strategy$model),
+    "20 configurations × 3 folds; selected settings tested on full folds",
+    sprintf(
+      "Selected workflow fitted on %s applicants",
+      format(nrow(train_modeling_base), big.mark = ",", scientific = FALSE)
+    ),
+    sprintf(
+      "Pooled OOF ROC-AUC %.4f; Brier %.5f; top decile captured %.2f%% of events",
+      selected_oof_auc,
+      selected_brier,
+      100 * top_decile_capture
+    ),
+    "Gender, age bands, and contract type with stability suppression",
+    sprintf(
+      paste0(
+        "Validated 48,744-row submission; Kaggle public ROC-AUC %.5f; ",
+        "private ROC-AUC %.5f"
+      ),
+      kaggle_public_score,
+      kaggle_private_score
+    )
+  )
+)
+
+knitr::kable(
+  objective_summary,
+  caption = "Assignment objective completion status"
+)
+```
+
+The selected model beats both the no-skill classifier and the simple logistic benchmark, and historical information provides incremental predictive value. The 0.79 ROC-AUC project target was not reached. This is reported as a result rather than addressed through further unplanned searches that could overfit the development data.
+
+## Limitations and governance controls
+
+| Limitation or risk | Implication | Required next control |
+|---|---|---|
+| Originated-applicant development sample | The model may not represent rejected or future applicants | Validate on the intended applicant population and monitor population shift |
+| No false-approval/false-decline cost ratio | ROC-AUC cannot determine an operating cutoff | Obtain stakeholder costs or an approved scenario range before threshold analysis |
+| No complete approval policy, pricing, or recovery data | Approval-rate and profit lift cannot be estimated | Conduct policy simulation after those inputs are supplied |
+| Anonymized external scores | Strong predictors are not fully explainable | Obtain provenance and reason-code support before production use |
+| Sensitive and proxy fields | Group performance may differ even when fields are excluded | Continue subgroup calibration, error-rate, and outcome monitoring |
+| Predictive feature importance | Importance is not causal direction or treatment effect | Use explanations only as predictive evidence; do not infer interventions |
+| Random 3-fold validation | Does not measure temporal policy or economic drift | Add out-of-time validation when application dates or later cohorts are available |
+| Payment-difficulty target | May not align with a regulatory default definition | Maintain the supplied target terminology and validate any regulatory mapping |
+
+These limitations constrain how the model can be used. The current evidence supports risk ranking within a similar originated-applicant population. It does not support automatic approvals, adverse-action reasons, causal claims, or a quantified approval-rate lift.
+
+## Reproducibility and artifact inventory
+
+```{r}
+#| label: reproducibility-inventory
+
+reproducibility_artifacts <- c(
+  "R/modeling_functions.R",
+  "R/modeling_recipes.R",
+  "data/processed/train_modeling_base.rds",
+  "data/processed/test_modeling_base.rds",
+  "models/tuned_xgboost_cv_record.rds",
+  "models/selected_xgboost_workflow.rds",
+  "models/selected_xgboost_metadata.rds",
+  "outputs/03_modeling.qmd"
+)
+
+artifact_inventory <- data.frame(
+  artifact = reproducibility_artifacts,
+  exists = file.exists(file.path(project_root, reproducibility_artifacts)),
+  size_megabytes = round(
+    file.info(file.path(project_root, reproducibility_artifacts))$size / 1024^2,
+    3
+  )
+)
+
+if (!all(artifact_inventory$exists)) {
+  stop(
+    "Reproducibility artifact(s) are missing: ",
+    paste(artifact_inventory$artifact[!artifact_inventory$exists], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  artifact_inventory,
+  caption = "Reproducibility artifact inventory"
+)
+
+reproducibility_environment <- data.frame(
+  component = c(
+    "Random seed", "R", "recipes", "rsample", "yardstick", "parsnip",
+    "workflows", "tune", "xgboost", "ranger", "glmnet", "themis"
+  ),
+  version = c(
+    as.character(model_seed),
+    paste(R.version$major, R.version$minor, sep = "."),
+    vapply(
+      c(
+        "recipes", "rsample", "yardstick", "parsnip", "workflows", "tune",
+        "xgboost", "ranger", "glmnet", "themis"
+      ),
+      function(package) as.character(utils::packageVersion(package)),
+      character(1)
+    )
+  )
+)
+
+knitr::kable(
+  reproducibility_environment,
+  caption = "Modeling seed and package versions"
+)
+```
+
+The compact `tuned_xgboost_cv_record.rds` preserves the Section 8 parameters and validation evidence without a fitted workflow. `selected_xgboost_workflow.rds` is the only model fitted on all development rows because it is the model supported by the stronger full-data validation evidence.
+
+## Generate and validate the submission file
+
+```{r}
+#| label: generate-validate-submission
+
+sample_submission_path <- file.path(
+  project_root, "data", "raw", "sample_submission.csv"
+)
+submission_path <- file.path(project_root, "outputs", "submission.csv")
+
+sample_submission <- utils::read.csv(
+  sample_submission_path,
+  check.names = FALSE
+)
+selected_model_for_scoring <- readRDS(selected_model_path)
+test_probabilities <- predict(
+  selected_model_for_scoring,
+  new_data = test_modeling_base,
+  type = "prob"
+)
+
+scored_test <- data.frame(
+  SK_ID_CURR = test_modeling_base$SK_ID_CURR,
+  TARGET = test_probabilities$.pred_payment_difficulty
+)
+submission_match <- match(sample_submission$SK_ID_CURR, scored_test$SK_ID_CURR)
+
+if (anyNA(submission_match)) {
+  stop("One or more sample-submission IDs lack a model prediction.")
+}
+
+# Reorder predictions to the official template before writing the Kaggle CSV.
+submission <- scored_test[submission_match, c("SK_ID_CURR", "TARGET")]
+row.names(submission) <- NULL
+
+if (!all(
+  is.finite(submission$SK_ID_CURR) &
+    submission$SK_ID_CURR == floor(submission$SK_ID_CURR)
+)) {
+  stop("Submission IDs must be finite whole numbers.")
+}
+
+# Format both numeric columns explicitly so R can never serialize a value with
+# exponent notation (for example, writing ID 400000 as 4e+05).
+submission_to_write <- data.frame(
+  SK_ID_CURR = sprintf("%.0f", submission$SK_ID_CURR),
+  TARGET = sprintf("%.17f", submission$TARGET),
+  stringsAsFactors = FALSE
+)
+utils::write.table(
+  submission_to_write,
+  submission_path,
+  sep = ",",
+  row.names = FALSE,
+  col.names = TRUE,
+  quote = FALSE
+)
+
+submission_lines <- readLines(submission_path, warn = FALSE)
+submission_has_scientific_notation <- any(grepl(
+  "[eE][+-]?[0-9]+",
+  submission_lines
+))
+
+submission_reloaded <- utils::read.csv(
+  submission_path,
+  check.names = FALSE
+)
+
+submission_checks <- c(
+  "Submission file exists" = file.exists(submission_path),
+  "Submission has required columns" = identical(
+    names(submission_reloaded), c("SK_ID_CURR", "TARGET")
+  ),
+  "Submission has 48,744 rows" = nrow(submission_reloaded) == 48744L,
+  "Submission IDs match the template order" = identical(
+    as.numeric(submission_reloaded$SK_ID_CURR),
+    as.numeric(sample_submission$SK_ID_CURR)
+  ),
+  "Submission IDs are unique" = !anyDuplicated(submission_reloaded$SK_ID_CURR),
+  "Submission contains no scientific notation" =
+    !submission_has_scientific_notation,
+  "Submission probabilities are complete" = !anyNA(submission_reloaded$TARGET),
+  "Submission probabilities are in [0, 1]" = all(
+    submission_reloaded$TARGET >= 0 & submission_reloaded$TARGET <= 1
+  )
+)
+
+if (!all(submission_checks)) {
+  stop(
+    "Submission validation failed: ",
+    paste(names(submission_checks)[!submission_checks], collapse = "; ")
+  )
+}
+
+knitr::kable(
+  data.frame(
+    check = c(
+      names(submission_checks),
+      "Kaggle public score",
+      "Kaggle private score"
+    ),
+    status = c(
+      ifelse(submission_checks, "Passed", "Failed"),
+      sprintf("%.5f", kaggle_public_score),
+      sprintf("%.5f", kaggle_private_score)
+    ),
+    row.names = NULL
+  ),
+  caption = "Submission-file validation and Kaggle score status"
+)
+```
+
+The generated file follows the provided template order and contains one probability for each of the 48,744 test applicants. Kaggle reported a public ROC-AUC of `r sprintf("%.5f", kaggle_public_score)` and a private ROC-AUC of `r sprintf("%.5f", kaggle_private_score)`.
+
+**Implications — Kaggle result:** The public and private leaderboard scores provide external ranking evidence consistent with the local validation result, but they do not replace the cross-validation and governance evidence above.
+
+**Takeaway from Section 10:** The model artifacts and submission file are reproducible, the Kaggle scores provide external ranking evidence, and subgroup variation and unresolved preparation sensitivities remain explicit governance or validation items.
+
+## Use of AI
+
+I used AI as a working partner throughout the modeling phase. It helped translate the modeling requirements into reusable R functions, fold-safe recipes, validation assertions, candidate workflows, randomized tuning, artifact checks, and notebook narrative. It also helped diagnose implementation issues, including the need for pre-recipe modeling tables, an oversized cache object, and lengthy tuning backtraces.
+
+I reviewed the resulting decisions and outputs against the data map, industry context, EDA plan, data-preparation rules, and executed validation results. AI-generated suggestions were not accepted solely because they improved a metric. For example, imbalance adjustments were rejected when they reduced ROC-AUC, and the 5K-tuned model was not selected after it underperformed the untuned model on the established full-data folds.
+
+# Conclusion
+
+The project produced a reusable, fold-safe R modeling pipeline and a selected XGBoost model that improves payment-difficulty ranking over the required benchmarks. The model achieves a pooled out-of-fold ROC-AUC of `r sprintf("%.4f", selected_oof_auc)`, compared with `r sprintf("%.4f", logistic_auc)` for the simple logistic benchmark and `r sprintf("%.4f", majority_auc)` for the majority classifier. Applicants in the highest predicted-risk decile have a `r sprintf("%.2f%%", 100 * top_decile_event_rate)` observed payment-difficulty rate and account for `r sprintf("%.2f%%", 100 * top_decile_capture)` of all observed events.
+
+Supplementary repayment and credit history adds measurable value, while explicit imbalance adjustments do not improve ranking for the tested XGBoost configuration. `r if (nrow(theme_importance) && identical(theme_importance$theme[1], "External risk score")) "External risk scores are the largest computed importance theme, creating an explainability dependency that requires additional governance before production use." else if (nrow(theme_importance)) sprintf("The largest computed importance theme is %s; its governance and explainability implications require review before production use.", theme_importance$theme[1]) else "No feature-importance theme was available for interpretation."`
+
+The evidence supports prioritizing applicants for further risk review within a similar population. It does not support an approval threshold, causal conclusions, or approval-rate lift. Those decisions require stakeholder cost inputs, rejected-applicant data, policy simulation, and jurisdiction-specific governance review. The submission achieved Kaggle ROC-AUC scores of `r sprintf("%.5f", kaggle_public_score)` on the public leaderboard and `r sprintf("%.5f", kaggle_private_score)` on the private leaderboard.
+
+```{r}
+#| label: stop-parallel-backend
+#| include: false
+
+if (!is.null(modeling_cluster)) {
+  parallel::stopCluster(modeling_cluster)
+  foreach::registerDoSEQ()
+}
+```

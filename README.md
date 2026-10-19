@@ -31,12 +31,13 @@ MSBA Capstone/
 |   `-- processed/
 |-- outputs/
 |   |-- 01_eda.qmd
-|   `-- 02_data_preparation.qmd
+|   |-- 02_data_preparation.qmd
+|   `-- 03_modeling.qmd
 |-- README.md
 `-- .gitignore
 ```
 
-Additional pages for modeling, evaluation, and business recommendations will be added as those phases begin.
+The modeling notebook contains the model comparisons, final validation, and Kaggle submission workflow.
 
 ## Data
 
@@ -46,7 +47,38 @@ The dataset includes current applications, previous applications, external burea
 
 ## Current Status
 
-Industry research, data mapping, exploratory analysis, and data preparation are complete. The prepared data and reusable preprocessing recipe are ready for the modeling and validation phases.
+Industry research, data mapping, exploratory analysis, data preparation, and modeling are complete. The selected model and validated Kaggle submission achieved ROC-AUC scores of **0.76189** on the public leaderboard and **0.75758** on the private leaderboard.
+
+## Modeling Results
+
+The modeling analysis is in [`outputs/03_modeling.qmd`](outputs/03_modeling.qmd). All model comparisons use the same three stratified cross-validation folds and ROC-AUC as the primary selection metric.
+
+Models and experiments included:
+
+- a majority-class classifier and a small application-only logistic regression as benchmarks;
+- ridge logistic regression using application-only and full-history predictor sets;
+- random forest using the full-history predictors;
+- XGBoost using application-only and full-history predictors;
+- full-history XGBoost with median imputation and missingness indicators versus native missing-value routing;
+- class-weighted, downsampled, and SMOTE versions of XGBoost; and
+- a 20-configuration randomized XGBoost search on a 5,000-row sample, followed by confirmation on the full-data folds.
+
+The principal full-data comparisons were:
+
+| Model | Predictor set / missing-value treatment | Mean 3-fold ROC-AUC | Result |
+|---|---|---:|---|
+| Majority-class benchmark | No predictors | 0.5000 | No-skill reference |
+| Simple logistic benchmark | Selected application fields; median imputation and indicators | 0.7331 | Established a useful interpretable benchmark |
+| Ridge logistic | Application only | 0.7451 | Improved on simple logistic |
+| Ridge logistic | Full history | 0.7522 | Supplementary history improved ridge |
+| Random forest | Full history | 0.7292 | Trailed the logistic and XGBoost candidates |
+| XGBoost | Application only | 0.7513 | Competitive without supplementary history |
+| XGBoost | Full history; median imputation and indicators | 0.7657 | Strongest main candidate and baseline for later experiments |
+| XGBoost | Full history; native missing-value routing | 0.7661 | Best full-data fold-mean ROC-AUC; selected |
+
+The selected model is **unadjusted, full-history XGBoost with native missing-value routing**. Its pooled out-of-fold ROC-AUC was **0.7660**, and its fold-mean ROC-AUC was **0.7661** (standard error **0.0011**), the highest full-data validation result among the evaluated models. Native routing slightly outperformed the otherwise identical median-imputation recipe, allowing XGBoost to learn the appropriate branch for missing numeric values. The tested class weighting, downsampling, and SMOTE adjustments did not improve ROC-AUC. Randomized tuning improved performance on the 5,000-row tuning sample, but the locked configuration trailed untuned full-history XGBoost by 0.0034 ROC-AUC when confirmed on the full-data folds; therefore neither an imbalance adjustment nor the tuned configuration was carried into the final model.
+
+The generated [`outputs/submission.csv`](outputs/submission.csv) contains probabilities for all 48,744 test applicants and passes the notebook's schema, ID, row-count, missing-value, probability-range, and plain-decimal-format checks. It achieved Kaggle ROC-AUC scores of **0.76189 public** and **0.75758 private**.
 
 ## Data Preparation and Feature Engineering
 

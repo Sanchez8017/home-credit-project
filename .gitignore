@@ -48,3 +48,5 @@ Thumbs.db
 *.zip
 *.gz
 models/
+outputs/submission.csv
+outputs/modeling_results/
